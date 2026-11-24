@@ -1,0 +1,255 @@
+#!/bin/sh /etc/rc.common
+
+USE_PROCD=1
+START=99
+STOP=10
+
+LIBEXEC=/usr/libexec/odash
+TABLE=odash
+
+load_cfg() {
+	config_load odash
+	config_get_bool ENABLED main enabled 1
+	config_get LAN_IFACES main lan_iface 'br-lan'
+	config_get INTERVAL main interval 30
+	config_get GROUP main group registrable
+	config_get RETENTION main retention_days 365
+	config_get IDLE main idle_timeout 2h
+	config_get STATE main state_dir /tmp/odash
+	config_get PERSIST main persist_file /etc/odash/stats.tsv
+	config_get SAVE_INTERVAL main save_interval 300
+	config_get_bool MANAGE_DNSMASQ main manage_dnsmasq 1
+
+	# empty = default location; 'off' = keep nothing on flash
+	[ -n "$PERSIST" ] || PERSIST=/etc/odash/stats.tsv
+	# the older defaults (1 h, 15 min) lost too much on a power cut
+	{ [ "$SAVE_INTERVAL" = 3600 ] || [ "$SAVE_INTERVAL" = 900 ]; } && SAVE_INTERVAL=300
+
+	case "$INTERVAL" in ''|*[!0-9]*) INTERVAL=30 ;; esac
+	case "$RETENTION" in ''|*[!0-9]*) RETENTION=30 ;; esac
+	case "$SAVE_INTERVAL" in ''|*[!0-9]*) SAVE_INTERVAL=300 ;; esac
+	[ "$GROUP" = full ] || GROUP=registrable
+}
+
+write_rules() {
+	local ifs="" i
+	for i in $LAN_IFACES; do
+		ifs="${ifs:+$ifs, }\"$i\""
+	done
+
+	# Counting happens before Passwall/xray/sing-box redirects (prerouting,
+	# priority raw) and after their NAT is undone (postrouting, priority 200),
+	# so proxied and VPN-tunnelled client traffic is still seen with the
+	# real remote address.
+	# Devices blocked from the LuCI Devices tab (odash.<dev>.blocked=1)
+	BLOCKED=""
+	add_blocked() {
+		local m b
+		config_get m "$1" mac
+		config_get b "$1" blocked 0
+		[ "$b" = 1 ] && [ -n "$m" ] && BLOCKED="${BLOCKED:+$BLOCKED, }$m"
+	}
+	config_load odash
+	config_foreach add_blocked device
+
+	cat > "$STATE/rules.nft" <<EOF
+table inet $TABLE {
+	set blocked {
+		type ether_addr
+		${BLOCKED:+elements = { $BLOCKED \}}
+	}
+	chain block {
+		type filter hook prerouting priority -320; policy accept;
+		iifname { $ifs } ether saddr @blocked counter drop
+	}
+	# per-device speed limits (filled by 'odash limit-sync'); they run
+	# before the counting chains so dropped packets are not counted
+	chain limit_up {
+		type filter hook prerouting priority -310; policy accept;
+	}
+	chain limit_dn {
+		type filter hook postrouting priority 100; policy accept;
+	}
+	set priv4 {
+		type ipv4_addr
+		flags interval
+		elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/3 }
+	}
+	set priv6 {
+		type ipv6_addr
+		flags interval
+		elements = { ::1, fc00::/7, fe80::/10, ff00::/8 }
+	}
+	set up4 {
+		type ipv4_addr . ipv4_addr
+		flags dynamic,timeout
+		timeout $IDLE
+		size 65535
+		counter
+	}
+	set up6 {
+		type ipv6_addr . ipv6_addr
+		flags dynamic,timeout
+		timeout $IDLE
+		size 65535
+		counter
+	}
+	set dn4 {
+		type ipv4_addr . ipv4_addr
+		flags dynamic,timeout
+		timeout $IDLE
+		size 65535
+		counter
+	}
+	set dn6 {
+		type ipv6_addr . ipv6_addr
+		flags dynamic,timeout
+		timeout $IDLE
+		size 65535
+		counter
+	}
+	chain upload {
+		type filter hook prerouting priority raw; policy accept;
+		iifname { $ifs } meta nfproto ipv4 ip daddr != @priv4 update @up4 { ip saddr . ip daddr }
+		iifname { $ifs } meta nfproto ipv6 ip6 daddr != @priv6 update @up6 { ip6 saddr . ip6 daddr }
+	}
+	chain download {
+		type filter hook postrouting priority 200; policy accept;
+		oifname { $ifs } meta nfproto ipv4 ip saddr != @priv4 update @dn4 { ip daddr . ip saddr }
+		oifname { $ifs } meta nfproto ipv6 ip6 saddr != @priv6 update @dn6 { ip6 daddr . ip6 saddr }
+	}
+}
+EOF
+}
+
+ensure_dnsmasq_logging() {
+	[ "$MANAGE_DNSMASQ" = 1 ] || return 0
+	[ "$(uci -q get 'dhcp.@dnsmasq[0].logqueries')" = 1 ] && return 0
+	uci -q set 'dhcp.@dnsmasq[0].logqueries=1' || return 0
+	uci -q commit dhcp
+	logger -t odash "enabled dnsmasq query logging, restarting dnsmasq"
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+
+# logread/tcpdump processes that an earlier version (or a killed awk) left behind have the init
+# process as their parent. Close only those; the ones that belong to a running awk are not touched.
+kill_stale_followers() {
+	for d in /proc/[0-9]*; do
+		c=""; read -r c < "$d/comm" 2>/dev/null || continue
+		case "$c" in logread|tcpdump) ;; *) continue ;; esac
+		cmd="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+		case "$cmd" in *"-e dnsmasq"*|*"udp src port 53"*) ;; *) continue ;; esac
+		read -r l < "$d/stat" || continue
+		set -- ${l##*) }
+		[ "$2" = 1 ] && kill "${d#/proc/}" 2>/dev/null
+	done
+}
+
+start_service() {
+	[ -x "$LIBEXEC/migrate" ] && "$LIBEXEC/migrate"
+	load_cfg
+	[ "$ENABLED" = 1 ] || return 0
+
+	mkdir -p "$STATE"
+	/usr/bin/odash router-sysh 1 >/dev/null 2>&1 &
+	write_rules
+	nft delete table inet "$TABLE" 2>/dev/null
+	if ! nft -f "$STATE/rules.nft"; then
+		logger -t odash "could not load nftables rules; run 'odash check'"
+		return 1
+	fi
+	# Fresh kernel counters: old baselines would be wrong.
+	rm -f "$STATE/prev"
+	/usr/bin/odash limit-sync force
+
+	ensure_dnsmasq_logging
+
+	kill_stale_followers
+
+	procd_open_instance dns
+	procd_set_param command /bin/sh "$LIBEXEC/dns-follow-run" \
+		-v "mapfile=$STATE/ipmap" \
+		-v "group=$GROUP" \
+		-v "cmd=logread -f -e dnsmasq" \
+		-f "$LIBEXEC/dns-follow.awk"
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+
+	# A proxy (PassWall 2) that answers the LAN's DNS itself: turn query logging on there too.
+	procd_open_instance dnswatch
+	procd_set_param command /bin/sh "$LIBEXEC/dnswatch"
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+
+	# Replies seen on the LAN: works even when a proxy/VPN (PassWall 2) takes
+	# over DNS so that dnsmasq never sees the clients' queries.
+	if command -v tcpdump >/dev/null 2>&1; then
+		procd_open_instance sniff
+		procd_set_param command /bin/sh "$LIBEXEC/dns-follow-run" \
+			-v "mapfile=$STATE/ipmap" \
+			-v "group=$GROUP" \
+			-v "source=tcpdump" \
+			-v "cmd=tcpdump -l -n -v -p -s 512 -i ${LAN_IFACES%% *} 'udp src port 53' 2>/dev/null" \
+			-f "$LIBEXEC/dns-follow.awk"
+		procd_set_param respawn 3600 5 0
+		procd_close_instance
+	fi
+
+	# Live throughput history for the LuCI chart (last ~10 minutes).
+	procd_open_instance rates
+	procd_set_param command "$LIBEXEC/rates"
+	procd_set_param env ST_STATE="$STATE" ST_TABLE="$TABLE" ST_RATE_STEP=3 ST_RATE_KEEP=200
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+
+	# Samba traffic per client (a separate nftables table, not part of the usage numbers)
+	if [ -x /usr/sbin/smbd ] && [ -x "$LIBEXEC/smbwatch" ]; then
+		procd_open_instance smbwatch
+		procd_set_param command /bin/sh "$LIBEXEC/smbwatch"
+		procd_set_param env ST_STATE="$STATE"
+		procd_set_param respawn 3600 5 0
+		procd_close_instance
+	fi
+
+	if [ -x "$LIBEXEC/led" ]; then
+		procd_open_instance led
+		procd_set_param command "$LIBEXEC/led"
+		procd_set_param respawn 3600 5 0
+		procd_close_instance
+	fi
+
+	if [ -x "$LIBEXEC/fan" ]; then
+		procd_open_instance fan
+		procd_set_param command /bin/sh "$LIBEXEC/fan"
+		procd_set_param respawn 3600 5 0
+		procd_close_instance
+	fi
+
+	procd_open_instance collector
+	procd_set_param command "$LIBEXEC/collector"
+	procd_set_param env \
+		ST_STATE="$STATE" ST_INTERVAL="$INTERVAL" ST_RETENTION="$RETENTION" \
+		ST_PERSIST="$PERSIST" ST_SAVE_INTERVAL="$SAVE_INTERVAL" ST_TABLE="$TABLE"
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+
+stop_service() {
+	load_cfg
+	case "$PERSIST" in
+		''|off) ;;
+		*)
+			mkdir -p "$(dirname "$PERSIST")"
+			[ -f "$STATE/stats.tsv" ] && cp "$STATE/stats.tsv" "$PERSIST.tmp" && mv -f "$PERSIST.tmp" "$PERSIST"
+			[ -f "$STATE/macmap" ] && cp "$STATE/macmap" "$PERSIST.macmap"
+			[ -f "$STATE/hourly.tsv" ] && cp "$STATE/hourly.tsv" "$PERSIST.hourly"
+			[ -f "$STATE/recent.tsv" ] && cp "$STATE/recent.tsv" "$PERSIST.recent"
+			;;
+	esac
+	nft delete table inet "$TABLE" 2>/dev/null
+	nft delete table inet odash_smb 2>/dev/null
+}
+
+service_triggers() {
+	procd_add_reload_trigger odash
+}

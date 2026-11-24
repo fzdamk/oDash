@@ -1,0 +1,113 @@
+#!/bin/sh
+# odash collector: every ST_INTERVAL seconds read the nftables
+# counters and fold them into $ST_STATE/stats.tsv (date, device, site, up, down).
+
+STATE="${ST_STATE:-/tmp/odash}"
+INTERVAL="${ST_INTERVAL:-30}"
+RETENTION="${ST_RETENTION:-30}"
+PERSIST="${ST_PERSIST:-}"
+SAVE_EVERY="${ST_SAVE_INTERVAL:-3600}"
+LIBEXEC="${ST_LIBEXEC:-/usr/libexec/odash}"
+TABLE="${ST_TABLE:-odash}"
+
+mkdir -p "$STATE"
+touch "$STATE/stats.tsv" "$STATE/prev" "$STATE/ipmap"
+
+# Copy the statistics (and the IP->MAC map) to flash so they survive a
+# reboot. Nothing is written when nothing changed, to spare the flash.
+save_one() {
+	[ -f "$1" ] || return 0
+	cmp -s "$1" "$2" 2>/dev/null && return 0
+	mkdir -p "$(dirname "$2")"
+	cp "$1" "$2.tmp" 2>/dev/null && mv -f "$2.tmp" "$2"
+}
+save_persist() {
+	case "$PERSIST" in ''|off) return 0 ;; esac
+	save_one "$STATE/stats.tsv" "$PERSIST"
+	save_one "$STATE/macmap" "$PERSIST.macmap"
+	save_one "$STATE/hourly.tsv" "$PERSIST.hourly"
+	save_one "$STATE/recent.tsv" "$PERSIST.recent"
+}
+
+case "$PERSIST" in
+	''|off) ;;
+	*)
+		[ -s "$PERSIST" ] && [ ! -s "$STATE/stats.tsv" ] && cp "$PERSIST" "$STATE/stats.tsv"
+		[ -s "$PERSIST.macmap" ] && [ ! -s "$STATE/macmap" ] && cp "$PERSIST.macmap" "$STATE/macmap"
+		[ -s "$PERSIST.hourly" ] && [ ! -s "$STATE/hourly.tsv" ] && cp "$PERSIST.hourly" "$STATE/hourly.tsv"
+		[ -s "$PERSIST.recent" ] && [ ! -s "$STATE/recent.tsv" ] && cp "$PERSIST.recent" "$STATE/recent.tsv"
+		;;
+esac
+
+collect_once() {
+	# right after a boot the clock may not be synced yet; wrong dates would
+	# file traffic under the wrong day
+	[ "$(date +%Y)" -ge 2024 ] || return 1
+	nft list table inet "$TABLE" >/dev/null 2>&1 || return 1
+
+	if [ -e "$STATE/reset.flag" ]; then
+		: > "$STATE/stats.tsv"
+		: > "$STATE/recent.tsv"
+		: > "$STATE/hourly.tsv"
+		rm -f "$STATE/reset.flag"
+		RESET_NOW=1
+	fi
+
+	today="$(date +%F)"
+	cutoff="$(date -d "@$(( $(date +%s) - RETENTION * 86400 ))" +%F)"
+
+	# client IP -> MAC, so a device keeps one identity across IPv4/IPv6 and
+	# address changes. Old entries are kept (bounded) for expired neighbours.
+	{
+		awk '{ print tolower($3) "\t" tolower($2) }' /tmp/dhcp.leases 2>/dev/null
+		ip neigh 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "lladdr") print tolower($1) "\t" tolower($(i + 1)) }'
+		cat "$STATE/macmap" 2>/dev/null
+	} | awk -F '\t' 'NF == 2 && $2 ~ /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f]){5}$/ && !seen[$1]++' | head -n 4000 > "$STATE/macmap.new"
+	mv -f "$STATE/macmap.new" "$STATE/macmap"
+
+	{
+		echo "@@ up"
+		nft list set inet "$TABLE" up4
+		nft list set inet "$TABLE" up6
+		echo "@@ down"
+		nft list set inet "$TABLE" dn4
+		nft list set inet "$TABLE" dn6
+	} > "$STATE/nft.dump" 2>/dev/null
+
+	awk \
+		-v mapfile="$STATE/ipmap" \
+		-v macfile="$STATE/macmap" \
+		-v purgefile="$STATE/purge" \
+		-v prevfile="$STATE/prev" \
+		-v statsfile="$STATE/stats.tsv" \
+		-v dumpfile="$STATE/nft.dump" \
+		-v outstats="$STATE/stats.new" \
+		-v outprev="$STATE/prev.new" \
+		-v today="$today" -v cutoff="$cutoff" \
+		-v now="$(date +%s)" -v recentfile="$STATE/recent.tsv" -v outrecent="$STATE/recent.new" -v hourfile="$STATE/hourly.tsv" -v outhour="$STATE/hourly.new" \
+		-f "$LIBEXEC/collect.awk" || return 1
+
+	mv -f "$STATE/prev.new" "$STATE/prev"
+	mv -f "$STATE/stats.new" "$STATE/stats.tsv"
+	[ -e "$STATE/recent.new" ] && mv -f "$STATE/recent.new" "$STATE/recent.tsv"
+	[ -e "$STATE/hourly.new" ] && mv -f "$STATE/hourly.new" "$STATE/hourly.tsv"
+	rm -f "$STATE/purge"
+	date +%s > "$STATE/last_update"
+}
+
+trap 'save_persist; exit 0' TERM INT
+
+since_save=$SAVE_EVERY
+RESET_NOW=0
+while :; do
+	collect_once
+	[ -x /usr/bin/odash ] && /usr/bin/odash limit-sync
+	since_save=$((since_save + INTERVAL))
+	if [ "$since_save" -ge "$SAVE_EVERY" ] || [ "$RESET_NOW" = 1 ]; then
+		RESET_NOW=0
+		save_persist
+		since_save=0
+	fi
+	sleep "$INTERVAL" &
+	wait $!
+done

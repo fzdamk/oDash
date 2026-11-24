@@ -1,0 +1,2987 @@
+#!/bin/sh
+# odash - per-site traffic usage CLI
+
+if [ -n "$ODASH_STATE" ]; then
+	STATE="$ODASH_STATE"
+else
+	STATE="$(uci -q get odash.main.state_dir 2>/dev/null)"
+	STATE="${STATE:-/tmp/odash}"
+fi
+ODASH_VERSION=1.0.0
+STATS="$STATE/stats.tsv"
+TABLE="${ST_TABLE:-odash}"
+TAB="$(printf '\t')"
+GROUPS_FILE="${ODASH_GROUPS:-/etc/odash/groups.conf}"
+IFNAMES_FILE="${ODASH_IFNAMES:-/etc/odash/ifnames}"
+IFORDER_FILE="${ODASH_IFORDER:-/etc/odash/iforder}"
+
+usage() {
+	cat <<EOF
+Usage: odash <command>   (the product is called oDash; the command is lowercase) [options]
+
+  top [-d DAYS] [-n COUNT] [-s total|down|up] [-c DEVICE]
+                                                show usage per site (default: 1 day, 20 rows);
+                                                -c limits it to one device (IP, name or MAC)
+  devices [-d DAYS]                             show usage per device
+  json [DAYS]                                   same data as JSON (used by LuCI)
+  live                                          current kernel counters as JSON
+  rates                                         live throughput history as JSON (live chart)
+  known                                         devices on the LAN as JSON (used by LuCI)
+  setdev MAC NAME [TYPE] [HOSTNAME] [IP]        name a device; HOSTNAME (letters, digits, -)
+                                                and IP are saved as its OpenWrt static lease
+                                                (empty IP = automatic address)
+  deldev MAC                                    forget the custom name/type of a device
+  limit MAC DOWN UP                             limit a device's speed in kbit/s (0 or empty =
+                                                unlimited); DOWN is download, UP is upload
+  mwan-info | mwan-iface-set IF K=V.. | mwan-setup failover|balance IF[:W].. | mwan-service on|off | mwan-install start|status   Multi-WAN (mwan3)
+  dsched-get | dsched-set MAC [RULE...] | dsched-run   time schedules per device (RULE = block|allow|days|HH:MM|HH:MM|1)
+  block MAC | unblock MAC                       cut a device off the network (and undo it)
+  remove MAC                                    delete a device: its name, static lease,
+                                                block and traffic history
+  status                                        show service state
+  check                                         verify this router can run the package
+  reset                                         clear all collected statistics
+  router-info                                   router, upstream connection and PassWall2 state as JSON
+  backup-get | backup-set ON DIR KEEP DOW HH:MM | backup-run | backup-restore FILE | backup-delete FILE   scheduled backup to a disk folder
+  pkg-version | pkg-chunk N B64 | pkg-apply     update from an uploaded release package
+  speed-sched-get | speed-sched-set ON direct|proxy|both MINUTES | speed-sched-run   scheduled speed tests
+  samba-traffic                                 Samba traffic per client as JSON
+  disk-list                                     USB disks, partitions and filesystems as JSON
+  disk-format DEV FS LABEL part|whole CONFIRM   format a partition (or erase a whole disk) as ext4|ntfs|exfat|vfat|f2fs
+  disk-mount DEV | disk-eject DEV [detach]      mount a partition; unmount it (or safely remove a disk)
+  router-tz ZONE POSIX                          set the time zone
+  router-passwall on|off                        switch PassWall2 on or off
+  passwall-info                                 PassWall2 settings and nodes (JSON)
+  passwall-set KEY 0|1                          client_proxy|localhost_proxy|dns_redirect|acl_enable
+  passwall-node ID                              choose the main PassWall2 node
+  router-iface-name IFACE [NAME]                give an interface a display name (empty NAME clears it)
+  router-iface-order [IFACE...]                 set the order of the interface list (no names = default)
+  router-live                                   CPU, temperature and network counters as JSON
+  router-ping HOST...                           ping several hosts at once
+  router-speed start [direct|proxy [URL CC CITY SPONSOR]]|status|history|history-clear   download speed test (optionally on a chosen server)
+  speed-servers COUNTRY [CC]                    test servers of a country (JSON list)
+  router-dnsleak start [quick]|status           DNS leak test (quick or extended)
+  router-sched-reboot HH:MM [DOW] | off         scheduled reboot (old, one rule)
+  router-sched-list | -save | -del | -run       schedules: reboot, Wi-Fi off, on, quiet hours
+  router-wifi-power on|off                      switch the Wi-Fi access points now
+  router-lan-set IP PREFIX                      change the LAN address
+  panel-domain-get                              show the domain that opens this panel
+  panel-domain-set [DOMAIN]                     set the panel domain (empty removes it)
+  router-dns-set IFACE auto|DNS...              DNS servers of an interface
+  router-wifi-info | router-wifi-scan           Travelmate state and nearby networks
+  router-wifi-set ID on|off|only                choose the Wi-Fi uplink
+  router-reboot                                 reboot the router
+  data-export | data-import-chunk N B64 | data-import-apply
+                                                save / restore settings, names, schedules, history
+  led-get | led-set KEY=VALUE... | led-test COLOR EFFECT SEC|off
+  fan-info | fan-set KEY=VALUE... | fan-test [off]
+                                                status LED settings and preview
+EOF
+}
+
+since_date() {
+	[ "$1" -gt 0 ] 2>/dev/null || { echo 0000-00-00; return; }
+	date -d "@$(( $(date +%s) - ($1 - 1) * 86400 ))" +%F
+}
+
+LAN_IFACES="$(uci -q get odash.main.lan_iface 2>/dev/null)"
+LAN_IFACES="${LAN_IFACES:-br-lan}"
+
+# devmap -> one record per line:
+#   D<TAB>mac<TAB>name<TAB>type<TAB>ip<TAB>hostname<TAB>static(0|1)<TAB>custom(0|1)<TAB>fixed_ip<TAB>blocked(0|1)<TAB>down_kbps<TAB>up_kbps
+#   I<TAB>ip<TAB>mac          (address -> device)
+# name: custom name from odash config, else the DHCP static-lease
+# hostname, else the hostname the device announced in its lease.
+devmap() {
+	{
+		echo "@@ leases";  cat /tmp/dhcp.leases 2>/dev/null
+		echo "@@ neigh";   ip neigh 2>/dev/null
+		echo "@@ map";     cat "$STATE/macmap" 2>/dev/null
+		echo "@@ dhcp";    uci -q -X show dhcp 2>/dev/null
+		echo "@@ cfg";     uci -q -X show odash 2>/dev/null
+	} | awk -v lan=" $LAN_IFACES " '
+		function okmac(m) { return m ~ /^[0-9a-f][0-9a-f](:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])(:[0-9a-f][0-9a-f])$/ }
+		function seen_mac(m) { if (!(m in all)) { all[m] = 1; order[++nm] = m } }
+		function guess(h,    l) {
+			l = tolower(h)
+			if (l ~ /watch/) return "watch"
+			if (l ~ /iphone|android|galaxy|pixel|redmi|xiaomi|huawei|oneplus|phone/) return "phone"
+			if (l ~ /ipad|tab|kindle/) return "tablet"
+			if (l ~ /macbook|laptop|thinkpad|notebook/) return "laptop"
+			if (l ~ /desktop-|^pc|-pc$|imac|^mac(-|$)|^mac$|workstation/) return "computer"
+			if (l ~ /tv|chromecast|roku|firetv|appletv|shield/) return "tv"
+			if (l ~ /playstation|ps[345]|xbox|switch|nintendo/) return "console"
+			if (l ~ /echo|homepod|sonos|speaker|nest-?mini|google-?home/) return "speaker"
+			if (l ~ /cam|doorbell/) return "camera"
+			if (l ~ /esp|tasmota|shelly|tuya|plug|bulb|sensor/) return "iot"
+			if (l ~ /router|openwrt|gl-|ap-|mesh/) return "router"
+			return "other"
+		}
+		function uval(v) { sub(/^[^=]*=/, "", v); gsub(/\047\\\047\047/, "\001", v); gsub(/\047/, "", v); gsub(/\001/, "\047", v); return v }
+		/^@@ / { mode = $2; next }
+		mode == "leases" && NF >= 4 {
+			m = tolower($2); if (!okmac(m)) next
+			seen_mac(m); lip[m] = $3; i2m[$3] = m
+			if ($4 != "*") lhost[m] = $4
+			next
+		}
+		mode == "neigh" {
+			for (i = 1; i < NF; i++) if ($i == "lladdr") {
+				m = tolower($(i + 1)); if (!okmac(m)) break
+				ip = tolower($1)
+				if (!(ip in i2m)) i2m[ip] = m
+				dev = ""
+				for (j = 1; j < NF; j++) if ($j == "dev") dev = $(j + 1)
+				if (index(lan, " " dev " ") && ip ~ /^[0-9.]+$/) {
+					seen_mac(m); if (!(m in lip)) lip[m] = ip
+				}
+				break
+			}
+			next
+		}
+		mode == "map" { split($0, f, "\t"); if (f[2] != "" && !(f[1] in i2m)) i2m[f[1]] = f[2]; next }
+		mode == "dhcp" || mode == "cfg" {
+			key = $0; sub(/=.*/, "", key)
+			n = split(key, k, ".")
+			if (n == 2) { stype[mode SUBSEP k[2]] = uval($0); next }
+			sec = mode SUBSEP k[2]
+			if (k[3] == "mac")  smac[sec] = tolower(uval($0))
+			if (k[3] == "name") sname[sec] = uval($0)
+			if (k[3] == "type") sty[sec] = uval($0)
+			if (k[3] == "ip")   sip[sec] = uval($0)
+			if (k[3] == "blocked") sblk[sec] = uval($0)
+			if (k[3] == "down_kbps") sdl[sec] = uval($0)
+			if (k[3] == "up_kbps") sul[sec] = uval($0)
+			secs[sec] = 1
+			next
+		}
+		END {
+			for (sec in secs) {
+				split(sec, p, SUBSEP)
+				if (p[1] == "dhcp" && stype[sec] != "host") continue
+				if (p[1] == "cfg" && stype[sec] != "device") continue
+				c = split(smac[sec], ms, " ")
+				for (x = 1; x <= c; x++) {
+					m = ms[x]; if (!okmac(m)) continue
+					seen_mac(m)
+					if (p[1] == "dhcp") { if (sname[sec] != "") shost[m] = sname[sec]; hasdh[m] = 1; if (sip[sec] != "") { fip[m] = sip[sec]; if (!(m in lip)) lip[m] = sip[sec] } }
+					else { if (sname[sec] != "") cname[m] = sname[sec]; if (sty[sec] != "") ctype[m] = sty[sec]; if (sblk[sec] == "1") blk[m] = 1; if (sdl[sec] + 0 > 0) dl[m] = sdl[sec] + 0; if (sul[sec] + 0 > 0) ul[m] = sul[sec] + 0 }
+				}
+			}
+			for (x = 1; x <= nm; x++) {
+				m = order[x]
+				h = (m in shost) ? shost[m] : lhost[m]
+				name = (m in cname) ? cname[m] : h
+				t = (m in ctype) ? ctype[m] : guess(h)
+				printf "D\t%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%d\t%d\t%d\n", m, name, t, lip[m], h, (m in shost), (m in cname), fip[m], (m in blk), dl[m] + 0, ul[m] + 0
+			}
+			for (ip in i2m) printf "I\t%s\t%s\n", ip, i2m[ip]
+		}
+	'
+}
+
+# resolve_client NAME_OR_IP_OR_MAC -> device id (MAC, or IP for unknown)
+resolve_client() {
+	devmap | awk -F "$TAB" -v q="$1" '
+		BEGIN { q = tolower(q) }
+		$1 == "D" && ($2 == q || tolower($3) == q || $5 == q || tolower($6) == q) { print $2; found = 1; exit }
+		$1 == "I" && $2 == q { print $3; found = 1; exit }
+		END { if (!found) print q }
+	'
+}
+
+# stats_mapped DAYS -> stats rows since DAYS, device column mapped to its MAC
+stats_mapped() {
+	[ -s "$STATS" ] || return 0
+	{ devmap; echo "@@ stats"; cat "$STATS"; } | awk -F "$TAB" -v OFS="$TAB" -v since="$(since_date "$1")" '
+		$0 == "@@ stats" { st = 1; next }
+		!st { if ($1 == "I") m[$2] = $3; next }
+		$1 >= since { if ($2 in m) $2 = m[$2]; print }
+	'
+}
+
+# aggregate DAYS SORTFIELD [CLIENT] -> site<TAB>up<TAB>down<TAB>total, sorted desc
+aggregate() {
+	stats_mapped "$1" | awk -F "$TAB" -v cl="$3" '
+		cl == "" || $2 == cl { u[$3] += $4; d[$3] += $5 }
+		END { for (s in u) printf "%s\t%.0f\t%.0f\t%.0f\n", s, u[s], d[s], u[s] + d[s] }
+	' | sort -t "$TAB" -k"$2","$2"nr
+}
+
+# dev_aggregate DAYS -> device<TAB>up<TAB>down<TAB>total sorted desc
+dev_aggregate() {
+	stats_mapped "$1" | awk -F "$TAB" '
+		{ u[$2] += $4; d[$2] += $5 }
+		END { for (s in u) printf "%s\t%.0f\t%.0f\t%.0f\n", s, u[s], d[s], u[s] + d[s] }
+	' | sort -t "$TAB" -k4,4nr
+}
+
+is_running() {
+	nft list table inet "$TABLE" >/dev/null 2>&1
+}
+
+cmd_top() {
+	days=1; count=20; by=4; client=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			-d) days="$2"; shift 2 ;;
+			-n) count="$2"; shift 2 ;;
+			-c) client="$(resolve_client "$2")"; shift 2 ;;
+			-s) case "$2" in up) by=2 ;; down) by=3 ;; *) by=4 ;; esac; shift 2 ;;
+			*) usage; exit 1 ;;
+		esac
+	done
+	case "$days$count" in *[!0-9]*|'') echo "DAYS and COUNT must be numbers" >&2; exit 1 ;; esac
+	[ "$days" -ge 1 ] || days=1
+
+	aggregate "$days" "$by" "$client" | head -n "$count" | awk -F "$TAB" '
+		function hum(b,    u, i) {
+			split("B KB MB GB TB", u, " ")
+			i = 1
+			while (b >= 1024 && i < 5) { b /= 1024; i++ }
+			return sprintf(i == 1 ? "%.0f %s" : "%.2f %s", b, u[i])
+		}
+		BEGIN { printf "%-38s %11s %11s %11s\n", "SITE", "DOWNLOAD", "UPLOAD", "TOTAL" }
+		{ printf "%-38s %11s %11s %11s\n", $1, hum($3), hum($2), hum($4) }
+	'
+}
+
+cmd_devices() {
+	days=1
+	[ "$1" = -d ] && days="$2"
+	case "$days" in ''|*[!0-9]*) days=1 ;; esac
+	[ "$days" -ge 1 ] || days=1
+	names="$(devmap)"
+	dev_aggregate "$days" | awk -F "$TAB" -v names="$names" '
+		function hum(b,    u, i) {
+			split("B KB MB GB TB", u, " ")
+			i = 1
+			while (b >= 1024 && i < 5) { b /= 1024; i++ }
+			return sprintf(i == 1 ? "%.0f %s" : "%.2f %s", b, u[i])
+		}
+		BEGIN {
+			n = split(names, l, "\n")
+			for (i = 1; i <= n; i++) { split(l[i], f, "\t"); if (f[1] == "D") { nm[f[2]] = f[3]; ip[f[2]] = f[5] } }
+			printf "%-18s %-15s %-22s %11s %11s %11s\n", "DEVICE", "IP", "NAME", "DOWNLOAD", "UPLOAD", "TOTAL"
+		}
+		{ printf "%-18s %-15s %-22s %11s %11s %11s\n", ($1 == "-" ? "(older data)" : $1), ip[$1], nm[$1], hum($3), hum($2), hum($4) }
+	'
+}
+
+cmd_json() {
+	days="${1:-1}"
+	hourmode=0; recfile=recent.tsv; recwin=3600
+	[ "$days" = h ] && { hourmode=1; days=0; }
+	[ "$days" = d ] && { hourmode=2; days=0; recfile=hourly.tsv; recwin=86400; }
+	case "$days" in ''|*[!0-9]*) days=1 ;; esac
+	running=false
+	is_running && running=true
+	last="$(cat "$STATE/last_update" 2>/dev/null)"
+	since="$(since_date "$days")"
+	{
+		echo "@@ names"
+		devmap
+		echo "@@ groups"
+		[ -r "$GROUPS_FILE" ] && cat "$GROUPS_FILE"
+		echo "@@ stats"
+		[ -s "$STATS" ] && cat "$STATS"
+		echo "@@ recent"
+		[ "$hourmode" != 0 ] && [ -s "$STATE/$recfile" ] && cat "$STATE/$recfile"
+	} | awk -F "$TAB" -v days="$days" -v running="$running" -v last="${last:-0}" -v since="$since" -v hourmode="$hourmode" -v recwin="$recwin" -v nowts="$(date +%s)" '
+		function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+		/^@@ / { mode = substr($0, 4); next }
+		mode == "names" {
+			if ($1 == "D") { nm[$2] = $3; ty[$2] = $4; ipof[$2] = $5 }
+			else if ($1 == "I") i2m[$2] = $3
+			next
+		}
+		mode == "groups" {
+			g = $0; sub(/#.*/, "", g)
+			n = split(g, w, /[ \t]+/)
+			p = ""
+			for (i = 1; i <= n; i++) {
+				if (w[i] == "") continue
+				if (p == "") { p = tolower(w[i]); gm[p] = p } else gm[tolower(w[i])] = p
+			}
+			next
+		}
+		mode == "stats" { dyu[$1] += $4; dyd[$1] += $5 }
+		mode == "recent" && $1 + (hourmode == 2 ? 3600 : 0) > nowts - recwin {
+			if ($2 in i2m) $2 = i2m[$2]
+			pu[$2 SUBSEP $3] += $4; pd[$2 SUBSEP $3] += $5
+			su[$3] += $4; sd[$3] += $5
+			du[$2] += $4; dd[$2] += $5
+			tu += $4; td += $5
+		}
+		mode == "stats" && !hourmode && $1 >= since {
+			if ($2 in i2m) $2 = i2m[$2]
+			pu[$2 SUBSEP $3] += $4; pd[$2 SUBSEP $3] += $5
+			su[$3] += $4; sd[$3] += $5
+			du[$2] += $4; dd[$2] += $5
+			tu += $4; td += $5
+		}
+		function parent_of(site,    l, n, i, j, suf) {
+			if (site in gm) return gm[site]
+			n = split(site, l, ".")
+			for (i = 2; i <= n - 1; i++) {
+				suf = l[i]
+				for (j = i + 1; j <= n; j++) suf = suf "." l[j]
+				if (suf in gm) return gm[suf]
+			}
+			return site
+		}
+		END {
+			printf "{\"days\":%d,\"running\":%s,\"updated\":%d,\"sites\":[", (hourmode ? -hourmode : days), running, last
+			n = 0
+			for (s in su) {
+				printf "%s{\"site\":\"%s\",\"parent\":\"%s\",\"up\":%.0f,\"down\":%.0f,\"total\":%.0f}", (n++ ? "," : ""), esc(s), esc(parent_of(s)), su[s], sd[s], su[s] + sd[s]
+			}
+			printf "],\"devices\":["
+			n = 0
+			for (d in du) {
+				ism = (d ~ /^[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]:[0-9a-f][0-9a-f]$/)
+				printf "%s{\"id\":\"%s\",\"ip\":\"%s\",\"mac\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"up\":%.0f,\"down\":%.0f,\"total\":%.0f}", (n++ ? "," : ""), esc(d), esc(ism ? ipof[d] : d), (ism ? d : ""), esc(nm[d]), esc(d in ty ? ty[d] : "other"), du[d], dd[d], du[d] + dd[d]
+			}
+			printf "],\"pairs\":["
+			n = 0
+			for (k in pu) {
+				split(k, kp, SUBSEP)
+				printf "%s[\"%s\",\"%s\",%.0f,%.0f]", (n++ ? "," : ""), esc(kp[1]), esc(kp[2]), pu[k], pd[k]
+			}
+			printf "],\"daily\":["
+			n = 0
+			for (k in dyu) printf "%s[\"%s\",%.0f,%.0f]", (n++ ? "," : ""), esc(k), dyu[k], dyd[k]
+			ns = 0; for (s in su) ns++
+			printf "],\"totals\":{\"up\":%.0f,\"down\":%.0f,\"total\":%.0f,\"sites\":%d}}\n", tu, td, tu + td, ns
+		}
+	'
+}
+
+# cmd_live: cumulative byte counters per device and per site straight from
+# the kernel sets. The LuCI page polls this every few seconds and turns the
+# differences into live rates.
+cmd_live() {
+	is_running || { echo '{"t":0,"clients":{},"sites":{}}'; return 0; }
+	{
+		devmap | grep "^I$TAB"
+		echo "@@ map"; cat "$STATE/ipmap" 2>/dev/null
+		echo "@@ up";   nft list set inet "$TABLE" up4 2>/dev/null; nft list set inet "$TABLE" up6 2>/dev/null
+		echo "@@ down"; nft list set inet "$TABLE" dn4 2>/dev/null; nft list set inet "$TABLE" dn6 2>/dev/null
+		echo "@@ end"
+	} | awk -v now="$(date +%s)" '
+		function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+		function isip(v) { return v ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ || (index(v, ":") && v ~ /^[0-9a-fA-F:]+$/) }
+		function flush(    i, s, n, t, k, cl, ip, b, c, st) {
+			if (buf == "") return
+			i = index(buf, "elements")
+			if (i > 0) {
+				s = substr(buf, i + 8); gsub(/[{},=]/, " ", s)
+				n = split(s, t, " "); cl = ""; ip = ""
+				for (k = 1; k <= n; k++) {
+					if (t[k] == ".") continue
+					if (isip(t[k])) { if (cl == "") cl = tolower(t[k]); else ip = tolower(t[k]); continue }
+					if (t[k] == "bytes" && ip != "") {
+						b = t[k + 1] + 0; k++
+						c = (cl in m) ? m[cl] : cl
+						st = (ip in map) ? map[ip] : ip
+						if (dir == "up") { cu[c] += b; su[st] += b } else { cd[c] += b; sd[st] += b }
+						cs[c] = 1; ss[st] = 1; cl = ""; ip = ""
+					}
+				}
+			}
+			buf = ""
+		}
+		/^I\t/ { split($0, f, "\t"); m[f[2]] = f[3]; next }
+		/^@@ / { flush(); dir = $2; next }
+		dir == "map" { split($0, f, "\t"); if (f[2] != "") map[f[1]] = f[2]; next }
+		/^table / { flush() }
+		dir != "" { buf = buf " " $0 }
+		END {
+			flush()
+			printf "{\"t\":%d,\"clients\":{", now
+			n = 0; for (c in cs) printf "%s\"%s\":[%.0f,%.0f]", (n++ ? "," : ""), esc(c), cu[c], cd[c]
+			printf "},\"sites\":{"
+			n = 0; for (c in ss) printf "%s\"%s\":[%.0f,%.0f]", (n++ ? "," : ""), esc(c), su[c], sd[c]
+			print "}}"
+		}
+	'
+}
+
+# cmd_rates: the sampler's history (last ~10 minutes, one sample per 3 s)
+cmd_rates() {
+	printf '{"now":%d,"running":%s,"pts":[' "$(date +%s)" "$(is_running && echo true || echo false)"
+	[ -s "$STATE/rates.log" ] && tail -n 200 "$STATE/rates.log" | awk 'NR > 1 { printf "," } { printf "%s", $0 }'
+	echo ']}'
+}
+
+# online : who is connected to the router right now (JSON):
+#   {"on":["mac",...],"wifi":{"mac":{"b":"5","s":-62,"snr":39,"rx":6.0,"tx":866.7}}}
+# Wi-Fi clients come from the association lists (band, signal, link rates), wired
+# ones from the neighbour table. rx = client to router, tx = router to client (Mbit/s).
+cmd_online() {
+	{
+		for d in $(iwinfo 2>/dev/null | awk '/ESSID/ { print $1 }'); do
+			f="$(iwinfo "$d" info 2>/dev/null | awk '/Channel:/ { for (i = 1; i <= NF; i++) if ($i ~ /^\(/) { print substr($i, 2); exit } }')"
+			echo "@@ wifi ${f:-0}"
+			iwinfo "$d" assoclist 2>/dev/null
+		done
+		echo "@@ neigh"
+		ip neigh 2>/dev/null
+	} | awk '
+		function q(s) { return "\"" s "\"" }
+		/^@@ wifi/ { mode = "wifi"; band = ($3 + 0 >= 5.9) ? "6" : (($3 + 0 >= 4.9) ? "5" : "2.4"); next }
+		/^@@ neigh/ { mode = "neigh"; next }
+		mode == "wifi" && $1 ~ /^[0-9A-Fa-f][0-9A-Fa-f]:/ {
+			m = tolower($1); on[m] = 1; b[m] = band; sg[m] = ""; snr[m] = ""
+			for (i = 2; i <= NF; i++) {
+				if ($i == "dBm" && sg[m] == "" && $(i - 1) ~ /^-?[0-9]+$/) sg[m] = $(i - 1)
+				if ($i == "(SNR") snr[m] = $(i + 1) + 0
+			}
+			cur = m; next
+		}
+		mode == "wifi" && cur != "" && $1 == "RX:" { rx[cur] = $2 + 0; next }
+		mode == "wifi" && cur != "" && $1 == "TX:" { tx[cur] = $2 + 0; next }
+		mode == "neigh" && ($NF == "REACHABLE" || $NF == "DELAY" || $NF == "PROBE") {
+			for (i = 1; i < NF; i++) if ($i == "lladdr") on[tolower($(i + 1))] = 1
+		}
+		END {
+			printf "{\"on\":["
+			n = 0; for (m in on) printf "%s%s", (n++ ? "," : ""), q(m)
+			printf "],\"wifi\":{"
+			n = 0
+			for (m in b) {
+				printf "%s%s:{\"b\":%s,\"s\":%s,\"snr\":%s,\"rx\":%s,\"tx\":%s}", (n++ ? "," : ""), q(m), q(b[m]), (sg[m] == "" ? "null" : sg[m]), (snr[m] == "" ? "null" : snr[m]), (rx[m] == "" ? "null" : rx[m]), (tx[m] == "" ? "null" : tx[m])
+			}
+			print "}}"
+		}'
+}
+
+cmd_known() {
+	devmap | awk -F "$TAB" '
+		function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+		BEGIN { printf "["; n = 0 }
+		$1 == "D" {
+			printf "%s{\"mac\":\"%s\",\"name\":\"%s\",\"type\":\"%s\",\"ip\":\"%s\",\"hostname\":\"%s\",\"static\":%s,\"custom\":%s,\"fixed_ip\":\"%s\",\"blocked\":%s,\"down_kbps\":%d,\"up_kbps\":%d}",
+				(n++ ? "," : ""), esc($2), esc($3), esc($4), esc($5), esc($6), ($7 == 1 ? "true" : "false"), ($8 == 1 ? "true" : "false"), esc($9), ($10 == 1 ? "true" : "false"), $11 + 0, $12 + 0
+		}
+		END { print "]" }
+	'
+}
+
+valid_mac() {
+	echo "$1" | grep -qiE '^[0-9a-f]{2}(:[0-9a-f]{2}){5}$'
+}
+
+# uci_find CONFIG TYPE MAC -> section id whose (list) mac contains MAC
+uci_find() {
+	uci -q -X show "$1" 2>/dev/null | awk -v t="$2" -v m="$3" '
+		{ key = $0; sub(/=.*/, "", key); val = $0; sub(/^[^=]*=/, "", val); gsub(/\047/, "", val)
+		  n = split(key, k, ".") }
+		n == 2 { ty[k[2]] = val; next }
+		k[3] == "mac" { c = split(tolower(val), ms, " "); for (i = 1; i <= c; i++) if (ms[i] == m) hit[k[2]] = 1 }
+		END { for (s in hit) if (ty[s] == t) { print s; exit } }
+	'
+}
+
+# lan_net -> "a.b.c.d prefix" of the LAN interface
+lan_net() {
+	addr="$(uci -q get network.lan.ipaddr)"; mask="$(uci -q get network.lan.netmask)"
+	echo "$addr $mask" | awk '{
+		split($1, a, "/"); ip = a[1]; pre = a[2]
+		if (pre == "" && $2 != "") { n = split($2, m, "."); pre = 0
+			for (i = 1; i <= 4; i++) { v = m[i] + 0; while (v > 0) { pre += v % 2; v = int(v / 2) } } }
+		if (pre == "") pre = 24
+		print ip, pre
+	}'
+}
+
+# check_ip IP MAC -> prints an error and returns 1 if IP cannot be given to MAC
+check_ip() {
+	echo "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || { echo "invalid IPv4 address: $1" >&2; return 1; }
+	set -- "$1" "$2" $(lan_net)
+	echo "$1 $3 $4" | awk '
+		function num(s,  p) { split(s, p, "."); return ((p[1] * 256 + p[2]) * 256 + p[3]) * 256 + p[4] }
+		{ split($1, o, "."); for (i = 1; i <= 4; i++) if (o[i] > 255) exit 2
+		  size = 2 ^ (32 - $3); a = num($1); r = num($2)
+		  if (int(a / size) != int(r / size)) exit 3
+		  if (a % size == 0 || a % size == size - 1) exit 4
+		  if (a == r) exit 5 }'
+	case $? in
+		2) echo "invalid IPv4 address: $1" >&2; return 1 ;;
+		3) echo "$1 is outside the LAN network $3/$4" >&2; return 1 ;;
+		4) echo "$1 is a network or broadcast address" >&2; return 1 ;;
+		5) echo "$1 is the router's own address" >&2; return 1 ;;
+	esac
+	other="$(uci -q -X show dhcp | awk -v ip="$1" -v m="$2" '
+		{ key = $0; sub(/=.*/, "", key); val = $0; sub(/^[^=]*=/, "", val); gsub(/\047/, "", val); n = split(key, k, ".") }
+		n == 3 && k[3] == "ip"  { hip[k[2]] = val }
+		n == 3 && k[3] == "mac" { hm[k[2]] = tolower(val) }
+		END { for (s in hip) if (hip[s] == ip && index(" " hm[s] " ", " " m " ") == 0) { print (hm[s] == "" ? s : hm[s]); exit } }')"
+	[ -z "$other" ] || { echo "$1 is already reserved for $other" >&2; return 1; }
+	return 0
+}
+
+cmd_setdev() {
+	mac="$(echo "$1" | tr 'A-F' 'a-f')"; name="$2"; type="${3:-other}"; host="$4"; fixed="$5"
+	valid_mac "$mac" || { echo "invalid MAC address: $1" >&2; exit 1; }
+	name="$(printf '%s' "$name" | tr -d '\000-\037' | cut -c1-64)"
+	case "$type" in computer|laptop|phone|tablet|watch|tv|console|speaker|camera|iot|router|other) ;; *) type=other ;; esac
+	if [ -n "$host" ]; then
+		echo "$host" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$' || {
+			echo "invalid hostname: use letters, digits and '-' (no spaces), max 63 chars" >&2; exit 1; }
+	fi
+	[ -z "$fixed" ] || check_ip "$fixed" "$mac" || exit 1
+
+	sec="$(uci_find odash device "$mac")"
+	[ -n "$sec" ] || { sec="$(uci add odash device)" && uci set "odash.$sec.mac=$mac"; }
+	if [ -n "$name" ]; then uci set "odash.$sec.name=$name"; else uci -q delete "odash.$sec.name"; fi
+	uci set "odash.$sec.type=$type"
+	uci commit odash
+
+	hs="$(uci_find dhcp host "$mac")"
+	if [ -z "$hs" ] && [ -n "$host$fixed" ]; then
+		hs="$(uci add dhcp host)" && uci set "dhcp.$hs.mac=$(echo "$mac" | tr 'a-f' 'A-F')"
+	fi
+	if [ -n "$hs" ]; then
+		[ -n "$host" ] && uci set "dhcp.$hs.name=$host"
+		if [ -n "$fixed" ]; then uci set "dhcp.$hs.ip=$fixed"; else uci -q delete "dhcp.$hs.ip"; fi
+		# a lease left with neither a name nor an address does nothing: drop it
+		[ -z "$(uci -q get "dhcp.$hs.name")$(uci -q get "dhcp.$hs.ip")" ] && uci delete "dhcp.$hs"
+		if [ -n "$(uci changes dhcp 2>/dev/null)" ]; then
+			uci commit dhcp
+			/etc/init.d/dnsmasq reload >/dev/null 2>&1
+		fi
+	fi
+	echo "saved"
+}
+
+cmd_deldev() {
+	mac="$(echo "$1" | tr 'A-F' 'a-f')"
+	valid_mac "$mac" || { echo "invalid MAC address: $1" >&2; exit 1; }
+	sec="$(uci_find odash device "$mac")"
+	[ -n "$sec" ] && { uci delete "odash.$sec"; uci commit odash; }
+	echo "removed"
+}
+
+# limit_rules -> nft commands (flush + one rule per limited device) on stdout
+limit_rules() {
+	{
+		echo "@@ neigh"; ip neigh 2>/dev/null
+		echo "@@ leases"; cat /tmp/dhcp.leases 2>/dev/null
+		echo "@@ cfg"; uci -q -X show odash 2>/dev/null
+	} | awk -v lan="$LAN_IFACES" '
+		function uval(v) { sub(/^[^=]*=/, "", v); gsub(/\047/, "", v); return v }
+		function burst(bps,  b) { b = int(bps / 20); return (b < 16384) ? 16384 : b }
+		function addip(m, ip) { if (ip ~ /^fe80:|^ff|^169\.254\./) return; if (!((m SUBSEP ip) in have)) { have[m SUBSEP ip] = 1; ips[m] = ips[m] " " ip } }
+		/^@@ / { mode = $2; next }
+		mode == "neigh" {
+			st = $NF; if (st == "FAILED" || st == "INCOMPLETE") next
+			for (i = 1; i < NF; i++) if ($i == "lladdr") addip(tolower($(i + 1)), tolower($1))
+			next
+		}
+		mode == "leases" && NF >= 4 { addip(tolower($2), $3); next }
+		mode == "cfg" {
+			key = $0; sub(/=.*/, "", key); n = split(key, k, ".")
+			if (n == 2) { ty[k[2]] = uval($0); next }
+			if (k[3] == "mac") smac[k[2]] = tolower(uval($0))
+			if (k[3] == "down_kbps") dl[k[2]] = uval($0) + 0
+			if (k[3] == "up_kbps") ul[k[2]] = uval($0) + 0
+			secs[k[2]] = 1
+		}
+		END {
+			nif = split(lan, ifa, " "); ifs = ""
+			for (i = 1; i <= nif; i++) ifs = ifs (i > 1 ? ", " : "") "\"" ifa[i] "\""
+			print "flush chain inet ODTABLE limit_up"
+			print "flush chain inet ODTABLE limit_dn"
+			for (s in secs) {
+				if (ty[s] != "device" || smac[s] == "") continue
+				m = smac[s]
+				if (ul[s] > 0) {
+					bps = ul[s] * 125
+					printf "add rule inet ODTABLE limit_up iifname { %s } ether saddr %s limit rate over %d bytes/second burst %d bytes counter drop\n", ifs, m, bps, burst(bps)
+				}
+				if (dl[s] > 0) {
+					bps = dl[s] * 125; v4 = ""; v6 = ""
+					c = split(ips[m], a, " ")
+					for (i = 1; i <= c; i++) if (a[i] ~ /:/) v6 = v6 (v6 == "" ? "" : ", ") a[i]; else v4 = v4 (v4 == "" ? "" : ", ") a[i]
+					if (v4 != "") printf "add rule inet ODTABLE limit_dn oifname { %s } ip daddr { %s } limit rate over %d bytes/second burst %d bytes counter drop\n", ifs, v4, bps, burst(bps)
+					if (v6 != "") printf "add rule inet ODTABLE limit_dn oifname { %s } ip6 daddr { %s } limit rate over %d bytes/second burst %d bytes counter drop\n", ifs, v6, bps, burst(bps)
+				}
+			}
+		}
+	' | sed "s/ODTABLE/$TABLE/g"
+}
+
+# limit-sync [force]: (re)apply the speed limits; skips the work when nothing changed
+cmd_limit_sync() {
+	mkdir -p "$STATE"
+	nft list table inet "$TABLE" >/dev/null 2>&1 || return 0
+	limit_rules | sort > "$STATE/limits.new"
+	if [ "$1" != force ] && cmp -s "$STATE/limits.new" "$STATE/limits.nft" 2>/dev/null; then
+		rm -f "$STATE/limits.new"; return 0
+	fi
+	# the flush lines must come first, so build the script in that order
+	{ grep '^flush' "$STATE/limits.new"; grep -v '^flush' "$STATE/limits.new"; } > "$STATE/limits.run"
+	if nft -f "$STATE/limits.run"; then
+		mv -f "$STATE/limits.new" "$STATE/limits.nft"
+	else
+		rm -f "$STATE/limits.new" "$STATE/limits.nft"; return 1
+	fi
+}
+
+# limit MAC DOWN_KBPS UP_KBPS
+cmd_limit() {
+	mac="$(echo "$1" | tr 'A-F' 'a-f')"; dn="${2:-0}"; up="${3:-0}"
+	valid_mac "$mac" || { echo "invalid MAC address: $1" >&2; exit 1; }
+	for v in "$dn" "$up"; do
+		case "$v" in ''|*[!0-9]*) echo "speed must be a whole number of kbit/s: $v" >&2; exit 1 ;; esac
+		[ "$v" -le 10000000 ] || { echo "speed too high: $v kbit/s" >&2; exit 1; }
+		[ "$v" -eq 0 ] || [ "$v" -ge 8 ] || { echo "speed must be 0 (unlimited) or at least 8 kbit/s" >&2; exit 1; }
+	done
+	sec="$(uci_find odash device "$mac")"
+	[ -n "$sec" ] || { sec="$(uci add odash device)" && uci set "odash.$sec.mac=$mac"; }
+	if [ "$dn" -gt 0 ]; then uci set "odash.$sec.down_kbps=$dn"; else uci -q delete "odash.$sec.down_kbps"; fi
+	if [ "$up" -gt 0 ]; then uci set "odash.$sec.up_kbps=$up"; else uci -q delete "odash.$sec.up_kbps"; fi
+	uci commit odash
+	if cmd_limit_sync force; then
+		echo "saved"
+	else
+		echo "saved; it takes effect when the odash service is running" >&2
+	fi
+}
+
+cmd_block() {
+	mac="$(echo "$1" | tr 'A-F' 'a-f')"
+	valid_mac "$mac" || { echo "invalid MAC address: $1" >&2; exit 1; }
+	sec="$(uci_find odash device "$mac")"
+	[ -n "$sec" ] || { sec="$(uci add odash device)" && uci set "odash.$sec.mac=$mac"; }
+	uci set "odash.$sec.blocked=1"
+	uci commit odash
+	nft add element inet "$TABLE" blocked "{ $mac }" 2>/dev/null ||
+		echo "saved; it takes effect when the odash service is running" >&2
+	echo "blocked"
+}
+
+cmd_unblock() {
+	mac="$(echo "$1" | tr 'A-F' 'a-f')"
+	valid_mac "$mac" || { echo "invalid MAC address: $1" >&2; exit 1; }
+	sec="$(uci_find odash device "$mac")"
+	[ -n "$sec" ] && { uci -q delete "odash.$sec.blocked"; uci commit odash; }
+	nft delete element inet "$TABLE" blocked "{ $mac }" 2>/dev/null
+	echo "unblocked"
+}
+
+cmd_remove() {
+	mac="$(echo "$1" | tr 'A-F' 'a-f')"
+	valid_mac "$mac" || { echo "invalid MAC address: $1" >&2; exit 1; }
+	[ -r "$DSCH_FILE" ] && grep -q "^$mac|" "$DSCH_FILE" && cmd_dsched_set "$mac" >/dev/null
+	nft delete element inet "$TABLE" blocked "{ $mac }" 2>/dev/null
+	sec="$(uci_find odash device "$mac")"
+	[ -n "$sec" ] && { uci delete "odash.$sec"; uci commit odash; cmd_limit_sync force; }
+	n=0
+	while hs="$(uci_find dhcp host "$mac")" && [ -n "$hs" ] && [ "$n" -lt 20 ]; do
+		uci delete "dhcp.$hs"; n=$((n + 1))
+	done
+	[ "$n" -gt 0 ] && { uci commit dhcp; /etc/init.d/dnsmasq reload >/dev/null 2>&1; }
+	# the collector drops this device's history on its next run
+	mkdir -p "$STATE" && echo "$mac" >> "$STATE/purge"
+	echo "removed"
+}
+
+cmd_status() {
+	if is_running; then echo "nftables counters : loaded"; else echo "nftables counters : NOT loaded"; fi
+	n=0
+	[ -f "$STATE/ipmap" ] && n="$(wc -l < "$STATE/ipmap")"
+	echo "known IP mappings : $n"
+	rows=0
+	[ -f "$STATS" ] && rows="$(wc -l < "$STATS")"
+	echo "stat rows         : $rows"
+	if [ -f "$STATE/last_update" ]; then
+		echo "last collection   : $(( $(date +%s) - $(cat "$STATE/last_update") ))s ago"
+	else
+		echo "last collection   : never"
+	fi
+}
+
+cmd_reset() {
+	: > "$STATS" 2>/dev/null
+	touch "$STATE/reset.flag" 2>/dev/null
+	echo "Statistics cleared."
+}
+
+cmd_check() {
+	ok=1
+	echo "kernel            : $(uname -r)"
+	if command -v nft >/dev/null 2>&1; then
+		echo "nft               : $(nft --version 2>&1 | head -n 1)"
+	else
+		echo "nft               : MISSING (this router has no nftables, e.g. an iptables-only firmware)"
+		exit 1
+	fi
+
+	t=st_selftest
+	nft delete table inet "$t" 2>/dev/null
+	if nft -f - >/dev/null 2>&1 <<EOF
+table inet $t {
+	set s4 { type ipv4_addr . ipv4_addr; flags dynamic,timeout; timeout 1m; size 16; counter; }
+	chain c {
+		type filter hook prerouting priority raw; policy accept;
+		meta nfproto ipv4 update @s4 { ip saddr . ip daddr }
+	}
+}
+EOF
+	then
+		echo "per-IP counters   : supported"
+	else
+		echo "per-IP counters   : NOT supported (kernel/nftables too old, needs about 5.11+)"
+		ok=0
+	fi
+	nft delete table inet "$t" 2>/dev/null
+
+	lq="$(uci -q get 'dhcp.@dnsmasq[0].logqueries' 2>/dev/null)"
+	if [ "$lq" = 1 ]; then echo "dnsmasq logging   : on"; else echo "dnsmasq logging   : off (set manage_dnsmasq=1 or dhcp.@dnsmasq[0].logqueries=1)"; fi
+
+	fo="$(uci -q get 'firewall.@defaults[0].flow_offloading' 2>/dev/null)"
+	if [ "$fo" = 1 ]; then echo "flow offloading   : ON - offloaded flows are not counted, turn it off"; else echo "flow offloading   : off"; fi
+	echo "note              : vendor 'Network Acceleration' / hardware NAT also bypasses counters; disable it."
+
+	[ "$ok" = 1 ] && echo "RESULT            : OK" || { echo "RESULT            : problems found"; exit 1; }
+}
+
+# ---- router tab: information and a few safe controls ----
+jesc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | tr -d '\r\n'; }
+
+cmd_router_info() {
+	board="$(ubus call system board 2>/dev/null)"
+	model="$(jsonfilter -s "$board" -e '@.model' 2>/dev/null)"
+	host="$(jsonfilter -s "$board" -e '@.hostname' 2>/dev/null)"
+	rel="$(jsonfilter -s "$board" -e '@.release.description' 2>/dev/null)"
+	up="$(cut -d. -f1 /proc/uptime)"
+	load="$(cut -d' ' -f1-3 /proc/loadavg)"
+	memt="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+	mema="$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)"
+	zone="$(uci -q get system.@system[0].zonename)"
+	tzs="$(uci -q get system.@system[0].timezone)"
+	ldef="$(ip -4 route show default 2>/dev/null | head -n 1)"
+	gdev="$(echo "$ldef" | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print $(i + 1) }')"
+	ggw="$(echo "$ldef" | awk '{ for (i = 1; i < NF; i++) if ($i == "via") print $(i + 1) }')"
+	dump="$(ubus call network.interface dump 2>/dev/null)"
+	ssid=""; sig=""
+	if [ -n "$gdev" ] && command -v iwinfo >/dev/null 2>&1; then
+		wi="$(iwinfo "$gdev" info 2>/dev/null)"
+		ssid="$(echo "$wi" | sed -n 's/.*ESSID: "\(.*\)".*/\1/p' | head -n 1)"
+		sig="$(echo "$wi" | sed -n 's/.*Signal: \(-\{0,1\}[0-9]*\) dBm.*/\1/p' | head -n 1)"
+	fi
+	pw=0; pwen=0; pwrun=0
+	if [ -x /etc/init.d/passwall2 ]; then
+		pw=1
+		[ "$(uci -q get passwall2.@global[0].enabled)" = 1 ] && pwen=1
+		pgrep -f /tmp/etc/passwall2 >/dev/null 2>&1 && pwrun=1
+	fi
+	printf '{"model":"%s","hostname":"%s","release":"%s","kernel":"%s","uptime":%d,"load":"%s",' \
+		"$(jesc "$model")" "$(jesc "$host")" "$(jesc "$rel")" "$(uname -r)" "${up:-0}" "$load"
+	printf '"mem_total":%d,"mem_free":%d,"time":"%s","tzabbr":"%s","zone":"%s","tz":"%s",' \
+		"${memt:-0}" "${mema:-0}" "$(date '+%Y-%m-%d %H:%M:%S')" "$(date +%Z)" "$(jesc "$zone")" "$(jesc "$tzs")"
+	printf '"gateway":"%s","gateway_dev":"%s","ssid":"%s","signal":"%s",' "$(jesc "$ggw")" "$(jesc "$gdev")" "$(jesc "$ssid")" "$(jesc "$sig")"
+	printf '"passwall":{"installed":%s,"enabled":%s,"running":%s},"interfaces":[' \
+		"$([ $pw = 1 ] && echo true || echo false)" "$([ $pwen = 1 ] && echo true || echo false)" "$([ $pwrun = 1 ] && echo true || echo false)"
+	first=1
+	for n in $(jsonfilter -s "$dump" -e '@.interface[*].interface' 2>/dev/null); do
+		case "$n" in *[!A-Za-z0-9_.-]*) continue ;; esac
+		q="@.interface[@.interface='$n']"
+		proto="$(jsonfilter -s "$dump" -e "$q.proto" 2>/dev/null)"
+		isup="$(jsonfilter -s "$dump" -e "$q.up" 2>/dev/null)"
+		dev="$(jsonfilter -s "$dump" -e "$q.l3_device" 2>/dev/null)"
+		[ -n "$dev" ] || dev="$(jsonfilter -s "$dump" -e "$q.device" 2>/dev/null)"
+		ip4="$(jsonfilter -s "$dump" -e "$q['ipv4-address'][0].address" 2>/dev/null)"
+		mask="$(jsonfilter -s "$dump" -e "$q['ipv4-address'][0].mask" 2>/dev/null)"
+		iup="$(jsonfilter -s "$dump" -e "$q.uptime" 2>/dev/null)"
+		gw="$(jsonfilter -s "$dump" -e "$q.route[@.target='0.0.0.0'].nexthop" 2>/dev/null | head -n 1)"
+		dns="$(jsonfilter -s "$dump" -e "$q['dns-server'][*]" 2>/dev/null | tr '\n' ' ')"
+		[ "$n" = loopback ] && continue
+		rxb=0; txb=0
+		case "$dev" in ''|*[!A-Za-z0-9_.@-]*) ;; *)
+			[ -r "/sys/class/net/$dev/statistics/rx_bytes" ] && rxb="$(cat "/sys/class/net/$dev/statistics/rx_bytes" 2>/dev/null)"
+			[ -r "/sys/class/net/$dev/statistics/tx_bytes" ] && txb="$(cat "/sys/class/net/$dev/statistics/tx_bytes" 2>/dev/null)" ;;
+		esac
+		dnsm="$(uci -q get network."$n".dns 2>/dev/null)"
+		alias=""
+		[ -r "$IFNAMES_FILE" ] && alias="$(awk -F'\t' -v n="$n" '$1 == n { print $2; exit }' "$IFNAMES_FILE")"
+		ord=999; [ -r "$IFORDER_FILE" ] && ord="$(awk -v n="$n" '$1 == n { print NR; exit }' "$IFORDER_FILE")"
+		[ -n "$ord" ] || ord=999
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"ord":%d,"name":"%s","alias":"%s","proto":"%s","up":%s,"device":"%s","ip":"%s","mask":"%s","uptime":%d,"gateway":"%s","dns":"%s","dns_manual":"%s","rx":%d,"tx":%d,"default":%s}' \
+			"$ord" "$n" "$(jesc "$alias")" "$(jesc "$proto")" "$([ "$isup" = true ] && echo true || echo false)" "$(jesc "$dev")" "$(jesc "$ip4")" "$(jesc "$mask")" "${iup:-0}" "$(jesc "$gw")" "$(jesc "$dns")" "$(jesc "$dnsm")" \
+			"${rxb:-0}" "${txb:-0}" "$([ -n "$gdev" ] && [ "$dev" = "$gdev" ] && echo true || echo false)"
+	done
+	printf '],"sched":%s}\n' "$(sched_json)"
+}
+
+# router-iface-name IFACE [NAME] : display name for an interface (the real interface is not touched)
+cmd_router_iface_name() {
+	i="$1"; shift
+	nm="$*"
+	case "$i" in ''|*[!A-Za-z0-9_.-]*) echo "invalid interface name" >&2; exit 1 ;; esac
+	nm="$(printf '%s' "$nm" | tr -d '\r\n\t' | cut -c1-32)"
+	mkdir -p "$(dirname "$IFNAMES_FILE")"
+	tmp="$IFNAMES_FILE.tmp"
+	{ [ -r "$IFNAMES_FILE" ] && awk -F'\t' -v n="$i" '$1 != n' "$IFNAMES_FILE"
+	  [ -n "$nm" ] && printf '%s\t%s\n' "$i" "$nm"; } > "$tmp"
+	mv "$tmp" "$IFNAMES_FILE"
+	echo ok
+}
+
+# router-iface-order [IFACE...] : the order of the interface list (kept in /etc, so it survives reboots; no names = back to the default)
+cmd_router_iface_order() {
+	for i in "$@"; do case "$i" in ''|*[!A-Za-z0-9_.-]*) echo "invalid interface name" >&2; exit 1 ;; esac; done
+	mkdir -p "$(dirname "$IFORDER_FILE")"
+	if [ $# -eq 0 ]; then rm -f "$IFORDER_FILE"; echo ok; return; fi
+	printf '%s\n' "$@" | awk '!s[$0]++' > "$IFORDER_FILE.tmp" && mv "$IFORDER_FILE.tmp" "$IFORDER_FILE"
+	echo ok
+}
+
+# router-tz ZONENAME POSIX_TZ : set the time zone
+cmd_router_tz() {
+	z="$1"; tzs="$2"
+	case "$z" in ''|*[!A-Za-z0-9_/+-]*) echo "invalid zone name" >&2; exit 1 ;; esac
+	case "$tzs" in ''|*[!A-Za-z0-9\<\>+:,./_-]*) echo "invalid time zone string" >&2; exit 1 ;; esac
+	uci set system.@system[0].zonename="$z"
+	uci set system.@system[0].timezone="$tzs"
+	uci commit system
+	/etc/init.d/system reload >/dev/null 2>&1
+	echo ok
+}
+
+# passwall-info : a few PassWall2 settings and the node list, as JSON
+cmd_passwall_info() {
+	[ -x /etc/init.d/passwall2 ] || { echo '{"installed":false}'; return 0; }
+	g="passwall2.@global[0]"
+	b() { [ "$(uci -q get "$g.$1")" = 1 ] && echo true || echo false; }
+	printf '{"installed":true,"node":"%s","client_proxy":%s,"localhost_proxy":%s,"dns_redirect":%s,"acl_enable":%s,"nodes":[' \
+		"$(jesc "$(uci -q get $g.node)")" "$(b client_proxy)" "$(b localhost_proxy)" "$(b dns_redirect)" "$(b acl_enable)"
+	first=1
+	for id in $(uci show passwall2 2>/dev/null | sed -n 's/^passwall2\.\([A-Za-z0-9_-]*\)=nodes$/\1/p'); do
+		nm="$(uci -q get passwall2.$id.remarks)"; [ -n "$nm" ] || nm="$id"
+		[ $first = 1 ] || printf ','
+		first=0
+		printf '{"id":"%s","name":"%s"}' "$id" "$(jesc "$nm")"
+	done
+	printf ']}\n'
+}
+
+# passwall-set KEY 0|1 : change one on/off setting and apply it
+cmd_passwall_set() {
+	[ -x /etc/init.d/passwall2 ] || { echo "PassWall2 is not installed" >&2; exit 1; }
+	case "$1" in client_proxy|localhost_proxy|dns_redirect|acl_enable) ;; *) echo "unknown setting" >&2; exit 1 ;; esac
+	case "$2" in 0|1) ;; *) echo "value must be 0 or 1" >&2; exit 1 ;; esac
+	uci set "passwall2.@global[0].$1=$2"; uci commit passwall2
+	[ "$(uci -q get passwall2.@global[0].enabled)" = 1 ] && ( /etc/init.d/passwall2 restart ) </dev/null >/dev/null 2>&1 &
+	return 0
+}
+
+# passwall-node ID : choose the main node
+cmd_passwall_node() {
+	[ -x /etc/init.d/passwall2 ] || { echo "PassWall2 is not installed" >&2; exit 1; }
+	case "$1" in ""|*[!A-Za-z0-9_-]*) echo "bad node" >&2; exit 1 ;; esac
+	[ "$(uci -q get passwall2.$1)" = nodes ] || { echo "no such node" >&2; exit 1; }
+	uci set "passwall2.@global[0].node=$1"; uci commit passwall2
+	[ "$(uci -q get passwall2.@global[0].enabled)" = 1 ] && ( /etc/init.d/passwall2 restart ) </dev/null >/dev/null 2>&1 &
+	return 0
+}
+
+# router-passwall on|off : switch PassWall2 on or off
+cmd_router_passwall() {
+	[ -x /etc/init.d/passwall2 ] || { echo "PassWall2 is not installed" >&2; exit 1; }
+	case "$1" in
+		on)  uci set passwall2.@global[0].enabled=1; uci commit passwall2
+		     ( /etc/init.d/passwall2 restart ) </dev/null >/dev/null 2>&1 & ;;
+		off) uci set passwall2.@global[0].enabled=0; uci commit passwall2
+		     ( /etc/init.d/passwall2 stop ) </dev/null >/dev/null 2>&1 & ;;
+		*) echo "usage: router-passwall on|off" >&2; exit 1 ;;
+	esac
+	echo ok
+}
+
+cmd_router_reboot() {
+	( sleep 3; reboot ) </dev/null >/dev/null 2>&1 &
+	echo rebooting
+}
+
+# ---- control center: live counters, tests, scheduled reboot, network and Wi-Fi settings ----
+RUNDIR=/tmp/odash
+CRON_FILE="${ODASH_CRON:-/etc/crontabs/root}"
+CRON_TAG="# odash-reboot"
+
+# router-live : light JSON for the live charts (read every couple of seconds)
+cmd_router_live() {
+	up="$(cut -d' ' -f1 /proc/uptime)"
+	cpu="$(awk '/^cpu / { t = 0; for (i = 2; i <= NF; i++) t += $i; printf "%d %d", t, $5 + $6; exit }' /proc/stat)"
+	ct="${cpu% *}"; ci="${cpu#* }"
+	load="$(cut -d' ' -f1-3 /proc/loadavg)"
+	memt="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"
+	mema="$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)"
+	freq=""
+	[ -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ] && freq="$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq) / 1000 ))"
+	dk="$(df -k /overlay 2>/dev/null | awk 'NR == 2 { print $2, $3 }')"
+	[ -n "$dk" ] || dk="$(df -k / 2>/dev/null | awk 'NR == 2 { print $2, $3 }')"
+	printf '{"up":%s,"cpu_total":%d,"cpu_idle":%d,"load":"%s","mem_total":%d,"mem_free":%d,"disk_total":%d,"disk_used":%d,"freq":%s,"temps":[' \
+		"${up:-0}" "${ct:-0}" "${ci:-0}" "$load" "${memt:-0}" "${mema:-0}" "${dk% *}" "${dk#* }" "${freq:-null}"
+	first=1
+	for z in /sys/devices/virtual/thermal/thermal_zone*; do
+		[ -r "$z/temp" ] || continue
+		t="$(cat "$z/temp" 2>/dev/null)"
+		[ -n "$t" ] || continue
+		ty="$(cat "$z/type" 2>/dev/null)"
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"name":"%s","c":%s}' "$(jesc "$ty")" "$(awk -v t="$t" 'BEGIN { printf "%.1f", t / 1000 }')"
+	done
+	for z in /sys/class/hwmon/hwmon*; do
+		[ -r "$z/temp1_input" ] || continue
+		t="$(cat "$z/temp1_input" 2>/dev/null)"
+		[ -n "$t" ] || continue
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"name":"%s","c":%s}' "$(jesc "$(cat "$z/name" 2>/dev/null)")" "$(awk -v t="$t" 'BEGIN { printf "%.1f", t / 1000 }')"
+	done
+	printf '],"net":['
+	awk 'NR > 2 { sub(":", " "); if ($1 == "lo") next; printf "%s{\"dev\":\"%s\",\"rx\":%s,\"tx\":%s}", (n++ ? "," : ""), $1, $2, $10 }' /proc/net/dev
+	printf ']}\n'
+}
+
+# ---- CPU / temperature history (one sample a minute, kept in RAM) ----
+SYSHIST="${ODASH_SYSHIST:-/tmp/odash/sys.hist}"
+sys_hot() {
+	m=0
+	for f in /sys/devices/virtual/thermal/thermal_zone*/temp /sys/class/hwmon/hwmon*/temp1_input; do
+		[ -r "$f" ] || continue
+		t="$(cat "$f" 2>/dev/null)"; [ -n "$t" ] || continue
+		[ "$t" -gt "$m" ] 2>/dev/null && m="$t"
+	done
+	echo "$((m / 1000))"
+}
+# connected devices, one observation a minute, kept 24 hours in RAM. A line is "time<TAB>mac<TAB>mac...";
+# a line with no macs means nobody was connected, so a gap never reads as a connection.
+# Every finished 10 minute bucket is also folded into CONNLONG (flash, 7 days) so the history outlives a reboot.
+CONNHIST="${ODASH_CONNHIST:-/tmp/odash/conn.hist}"
+CONNLONG="${ODASH_CONNLONG:-/etc/odash/conn.long}"
+conn_sample() {
+	now="$(date +%s)"
+	[ "$now" -ge 1704067200 ] || return 0
+	out="$(cmd_online 2>/dev/null)"
+	jsonfilter -s "$out" -e '@.on' >/dev/null 2>&1 || return 0
+	macs="$(jsonfilter -s "$out" -e '@.on[*]' 2>/dev/null | awk 'length($0) == 17 && !seen[tolower($0)]++ { printf "\t%s", tolower($0) }')"
+	printf '%s%s\n' "$now" "$macs" >> "$CONNHIST"
+	n="$(wc -l < "$CONNHIST")"
+	[ "$n" -gt 1500 ] && { tail -n 1440 "$CONNHIST" > "$CONNHIST.t"; mv "$CONNHIST.t" "$CONNHIST"; }
+	b=$((now / 600))
+	lb="$(cat "$CONNHIST.lb" 2>/dev/null)"
+	if [ -n "$lb" ] && [ "$b" -gt "$lb" ] 2>/dev/null; then
+		mkdir -p "$(dirname "$CONNLONG")"
+		awk -F '\t' -v lb="$lb" '
+			int($1 / 600) == lb { f = 1; for (i = 2; i <= NF; i++) if (!($i in s)) { s[$i] = 1; m = m "\t" $i } }
+			END { if (f) printf "%d%s\n", lb * 600, m }
+		' "$CONNHIST" >> "$CONNLONG"
+		n="$(wc -l < "$CONNLONG")"
+		[ "$n" -gt 1100 ] && { tail -n 1008 "$CONNLONG" > "$CONNLONG.t"; mv "$CONNLONG.t" "$CONNLONG"; }
+	fi
+	echo "$b" > "$CONNHIST.lb"
+	return 0
+}
+# connections [hours] : JSON of the stored observations. Up to 24 hours: one sample a minute.
+# Longer: 10 minute buckets (finished ones from CONNLONG, the open ones built from the minute file).
+cmd_connections() {
+	now="$(date +%s)"
+	hrs="${1:-24}"
+	case "$hrs" in ''|*[!0-9]*) hrs=24 ;; esac
+	[ "$hrs" -gt 168 ] && hrs=168
+	if [ "$hrs" -le 24 ]; then
+		[ -r "$CONNHIST" ] || { printf '{"now":%s,"step":60,"samples":[]}\n' "$now"; return; }
+		awk -F '\t' -v now="$now" -v from="$((now - hrs * 3600))" '
+			BEGIN { printf "{\"now\":%d,\"step\":60,\"samples\":[", now }
+			$1 >= from && $1 <= now {
+				printf "%s[%d,[", (n++ ? "," : ""), $1
+				for (i = 2; i <= NF; i++) printf "%s\"%s\"", (i > 2 ? "," : ""), $i
+				printf "]]"
+			}
+			END { printf "]}\n" }
+		' "$CONNHIST"
+		return
+	fi
+	[ -e "$CONNLONG" ] || CONNLONG=/dev/null
+	[ -e "$CONNHIST" ] || CONNHIST=/dev/null
+	awk -F '\t' -v now="$now" -v from="$((now - hrs * 3600))" '
+		function emit(ts, line,   k, a, c) {
+			c = split(line, a, "\t")
+			printf "%s[%d,[", (n++ ? "," : ""), ts
+			for (k = 2; k <= c; k++) printf "%s\"%s\"", (k > 2 ? "," : ""), a[k]
+			printf "]]"
+		}
+		BEGIN { printf "{\"now\":%d,\"step\":600,\"samples\":[", now }
+		FILENAME == ARGV[1] {
+			if ($1 >= from && $1 <= now) { emit($1, $0); last = $1 }
+			next
+		}
+		{
+			b = int($1 / 600) * 600
+			if (b <= last || b < from - 600) next
+			if (!(b in seen)) { seen[b] = 1; ord[++cnt] = b }
+			for (i = 2; i <= NF; i++) if (!((b, $i) in has)) { has[b, $i] = 1; line[b] = line[b] "\t" $i }
+		}
+		END { for (j = 1; j <= cnt; j++) emit(ord[j], ord[j] line[ord[j]]); printf "]}\n" }
+	' "$CONNLONG" "$CONNHIST"
+}
+
+cmd_router_sample() {
+	mkdir -p "$(dirname "$SYSHIST")"
+	conn_sample
+	cur="$(awk '/^cpu / { t = 0; for (i = 2; i <= NF; i++) t += $i; printf "%d %d", t, $5 + $6; exit }' /proc/stat)"
+	prev="$(cat "$SYSHIST.prev" 2>/dev/null)"
+	echo "$cur" > "$SYSHIST.prev"
+	[ -n "$prev" ] || return 0
+	pct="$(echo "$prev $cur" | awk '{ dt = $3 - $1; di = $4 - $2; v = 0; if (dt > 0) v = 100 * (1 - di / dt) + 0.5; printf "%d", v }')"
+	load="$(cut -d' ' -f1 /proc/loadavg)"
+	memt="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)"; mema="$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)"
+	mem="$(awk -v t="${memt:-0}" -v a="${mema:-0}" 'BEGIN { v = 0; if (t > 0) v = 100 * (t - a) / t; printf "%d", v }')"
+	[ -n "$pct" ] || return 0
+	echo "$(date +%s) $pct $(sys_hot) ${load:-0} $mem" >> "$SYSHIST"
+	n="$(wc -l < "$SYSHIST")"
+	[ "$n" -gt 1500 ] && { tail -n 1440 "$SYSHIST" > "$SYSHIST.t"; mv "$SYSHIST.t" "$SYSHIST"; }
+	return 0
+}
+sample_cron_ensure() {
+	grep -q "odash-sample" "$CRON_FILE" 2>/dev/null && return 0
+	touch "$CRON_FILE"
+	echo "* * * * * /usr/bin/odash router-sample >/dev/null 2>&1 # odash-sample" >> "$CRON_FILE"
+	/etc/init.d/cron enable >/dev/null 2>&1; /etc/init.d/cron restart >/dev/null 2>&1
+}
+# router-sysh [minutes] : JSON arrays of the stored samples
+cmd_router_sysh() {
+	sample_cron_ensure
+	m="${1:-60}"; case "$m" in ''|*[!0-9]*) m=60 ;; esac
+	now="$(date +%s)"
+	[ -r "$SYSHIST" ] || : > "$SYSHIST"
+	# nothing recorded yet (first start, or after a restart): take two samples now so the chart is not empty
+	[ "$(wc -l < "$SYSHIST")" -ge 2 ] || { cmd_router_sample; sleep 1; cmd_router_sample; sleep 1; cmd_router_sample; }
+	awk -v lo="$((now - m * 60))" 'BEGIN { printf "{\"pts\":[" } $1 >= lo { printf "%s[%d,%d,%d,%s,%d]", (n++ ? "," : ""), $1, $2, $3, $4, $5 } END { printf "]}\n" }' "$SYSHIST"
+}
+
+# router-ping HOST... : ping several hosts at the same time, JSON result
+cmd_router_ping() {
+	d="$RUNDIR/ping.$$"; mkdir -p "$d"
+	n=0
+	for h in "$@"; do
+		case "$h" in ''|*[!A-Za-z0-9._:-]*) continue ;; esac
+		[ "$n" -ge 12 ] && break
+		n=$((n + 1))
+		echo "$h" > "$d/$n.h"
+		( ping -c 3 -W 2 -q "$h" > "$d/$n.o" 2>&1 ) </dev/null >/dev/null 2>&1 &
+	done
+	wait
+	printf '['
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		i=$((i + 1))
+		h="$(cat "$d/$i.h")"
+		stats="$(sed -n 's/.*min\/avg\/max[^=]*= *\([0-9./]*\).*/\1/p' "$d/$i.o" | head -n 1)"
+		loss="$(sed -n 's/.* \([0-9]*\)% packet loss.*/\1/p' "$d/$i.o" | head -n 1)"
+		[ "$i" -gt 1 ] && printf ','
+		if [ -n "$stats" ]; then
+			printf '{"host":"%s","ok":true,"min":%s,"avg":%s,"max":%s,"loss":%d}' "$(jesc "$h")" \
+				"$(echo "$stats" | cut -d/ -f1)" "$(echo "$stats" | cut -d/ -f2)" "$(echo "$stats" | cut -d/ -f3)" "${loss:-0}"
+		else
+			printf '{"host":"%s","ok":false,"loss":%d}' "$(jesc "$h")" "${loss:-100}"
+		fi
+	done
+	printf ']\n'
+	rm -rf "$d"
+}
+
+# run a function in the background and keep its JSON result in a file
+bg_job() { # name function
+	mkdir -p "$RUNDIR"
+	f="$RUNDIR/$1.json"
+	if [ -f "$RUNDIR/$1.pid" ] && kill -0 "$(cat "$RUNDIR/$1.pid")" 2>/dev/null; then
+		echo '{"state":"running"}'; return
+	fi
+	echo '{"state":"running"}' > "$f"
+	( "$2" > "$f.tmp" 2>/dev/null; [ -s "$f.tmp" ] && mv "$f.tmp" "$f" || echo '{"state":"error"}' > "$f"; rm -f "$RUNDIR/$1.pid" ) </dev/null >/dev/null 2>&1 &
+	echo $! > "$RUNDIR/$1.pid"
+	echo '{"state":"running"}'
+}
+bg_status() { [ -r "$RUNDIR/$1.json" ] && cat "$RUNDIR/$1.json" || echo '{"state":"idle"}'; }
+
+# parse "time=12.3 ms" lines of a ping run: min avg max jitter loss(%) sent
+ping_stats() { # file sent
+	sed -n 's/.*time=\([0-9.]*\) ms.*/\1/p' "$1" | awk -v sent="$2" '
+		{ t[NR] = $1; s += $1; if (NR == 1 || $1 < mn) mn = $1; if ($1 > mx) mx = $1 }
+		END {
+			if (NR == 0) { printf "0 0 0 0 100"; exit }
+			for (i = 2; i <= NR; i++) { d = t[i] - t[i-1]; j += (d < 0 ? -d : d) }
+			printf "%.1f %.1f %.1f %.1f %d", mn, s / NR, mx, (NR > 1 ? j / (NR - 1) : 0), (sent - NR) * 100 / sent }'
+}
+ping_run() { # host count file
+	ping -c "$2" -i 0.2 -W 2 "$1" > "$3" 2>/dev/null || ping -c "$2" -W 2 "$1" > "$3" 2>/dev/null
+}
+speed_live() { # phase now
+	printf '{"state":"running","phase":"%s","now":%s,"ping":%s,"dl":[%s],"ul":[%s],"loaded_dl":%s,"colo":"%s","loc":"%s","ip":"%s"}\n' \
+		"$1" "${2:-0}" "${SP_PING:-null}" "$SP_DL" "$SP_UL" "${SP_LDL:-null}" "$SP_COLO" "$SP_LOC" "$SP_IP" > "$RUNDIR/speed.live.tmp" && mv "$RUNDIR/speed.live.tmp" "$RUNDIR/speed.live"
+}
+# download streams: a fast line finishes one test file in a fraction of a second, so several streams
+# fetch the file again and again. Each finished file is counted in done.N and removed; the total is
+# the finished files plus the part of every file still being written.
+# size of a file in bytes without reading it (busybox wc -c reads the whole file, which is slow for a growing download)
+fsize() { # file
+	set -- $(ls -l "$1" 2>/dev/null); echo "${5:-0}"
+}
+speed_dl_total() { # workdir
+	t=0
+	for f in "$1"/done.*; do [ -f "$f" ] || continue; while read n; do t=$((t + ${n:-0})); done < "$f"; done
+	for f in "$1"/dl.*; do [ -f "$f" ] || continue; n="$(fsize "$f")"; t=$((t + ${n:-0})); done
+	echo "$t"
+}
+speed_dl_start() { # workdir url streams
+	read up0 _ < /proc/uptime; end=$(( ${up0%%.*} + 30 ))   # a stream never runs longer than 30 s, whatever happens
+	for i in $3; do
+		(
+			while [ ! -e "$1/stop" ]; do
+				read upn _ < /proc/uptime; [ "${upn%%.*}" -lt "$end" ] || break
+				uclient-fetch -q -T 15 -O "$1/dl.$i" "$2" </dev/null >/dev/null 2>&1 &
+				echo $! > "$1/pid.$i"
+				wait $!
+				[ -e "$1/stop" ] && break
+				n="$(fsize "$1/dl.$i")"; [ "${n:-0}" -gt 0 ] || break
+				rm -f "$1/dl.$i"; echo "$n" >> "$1/done.$i"
+			done
+		) </dev/null >/dev/null 2>&1 &
+	done
+}
+speed_dl_stop() { # workdir
+	: > "$1/stop"
+	for f in "$1"/pid.*; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null; done
+}
+# sample a growing file (download) or an interface counter (upload) for up to $2 seconds
+speed_dir() { # phase pid maxsecs source(file|tx) arg
+	phase="$1"; pid="$2"; maxs="$3"; kind="$4"; arg="$5"
+	t=0; prev=0; first=""; firstt=0; bytes=0; samples=""; pts=""
+	read up0 _ < /proc/uptime
+	while [ "$kind" = dl ] || kill -0 "$pid" 2>/dev/null; do
+		sleep 0.5 2>/dev/null || sleep 1
+		read up _ < /proc/uptime
+		el="$(awk -v a="$up0" -v b="$up" 'BEGIN { printf "%.2f", b - a }')"
+		if [ "$kind" = file ]; then cur="$(fsize "$arg")"; elif [ "$kind" = dl ]; then cur="$(speed_dl_total "$arg")"; else read cur < "$arg"; fi
+		cur="${cur:-0}"
+		[ -n "$first" ] || { first="$cur"; firstt="$el"; prev="$cur"; prevt="$el"; continue; }
+		now="$(awk -v c="$cur" -v p="$prev" -v e="$el" -v pe="$prevt" 'BEGIN { d = e - pe; v = (d > 0 && c >= p) ? (c - p) * 8 / d / 1000000 : 0; printf "%.2f", v }')"
+		prev="$cur"; prevt="$el"
+		samples="${samples:+$samples,}$now"; pts="$pts $el:$cur"
+		if [ "$phase" = download ]; then SP_DL="$samples"; else SP_UL="$samples"; fi
+		speed_live "$phase" "$now"
+		awk -v e="$el" -v m="$maxs" 'BEGIN { exit !(e >= m) }' && break
+	done
+	[ "$kind" = dl ] || kill "$pid" 2>/dev/null
+	read up _ < /proc/uptime
+	el="$(awk -v a="$up0" -v b="$up" 'BEGIN { printf "%.2f", b - a }')"
+	if [ "$kind" = file ]; then cur="$(fsize "$arg")"; elif [ "$kind" = dl ]; then cur="$(speed_dl_total "$arg")"; else read cur < "$arg"; fi
+	SP_BYTES=$(( ${cur:-0} - ${first:-0} )); SP_SECS="$(awk -v e="$el" -v f="$firstt" 'BEGIN { printf "%.2f", e - f }')"
+	# average = bytes moved / time, from the moment data started flowing (the first two
+	# seconds are skipped when the test ran long enough); idle samples do not pull it down
+	pts="$pts $el:${cur:-0}"
+	SP_MBPS="$(echo "$pts" | tr ' ' '\n' | awk -F: 'NF == 2 { n++; t[n] = $1 + 0; b[n] = $2 + 0 } END { s = 0; for (i = 2; i <= n; i++) if (b[i] > b[1]) { s = i - 1; break }; if (!s) { printf "0.00"; exit } k = s; for (i = s; i <= n; i++) if (t[i] - t[s] >= 2) { k = i; break }; if (t[n] - t[s] <= 6) k = s; d = t[n] - t[k]; printf "%.2f", (d > 0 ? (b[n] - b[k]) * 8 / d / 1000000 : 0) }')"
+}
+# direct mode: let PassWall2 send the test servers straight out (the set entries expire by themselves)
+speed_direct_on() {
+	SP_NFT=""
+	command -v nft >/dev/null 2>&1 && nft list set inet passwall2 psw2_direct >/dev/null 2>&1 || return 0
+	for a in $(nslookup "${SP_DHOST:-speed.cloudflare.com}" 2>/dev/null | sed -n 's/^Address[^:]*: *\([0-9][0-9.]*\)$/\1/p; s/^Address *[0-9]*: *\([0-9][0-9.]*\).*$/\1/p' | grep -v '^127\.\|^1\.1\.1\.1$' | sort -u) ${SP_DEXTRA-1.1.1.1}; do
+		nft add element inet passwall2 psw2_direct "{ $a timeout 240s }" 2>/dev/null && SP_NFT="$SP_NFT $a"
+	done
+}
+speed_direct_off() {
+	for a in $SP_NFT; do nft delete element inet passwall2 psw2_direct "{ $a }" 2>/dev/null; done
+}
+SPEED_HIST="${ODASH_SPEEDHIST:-/etc/odash/speed.hist}"
+speed_hist_add() { # json (one result); keeps the newest 300
+	mkdir -p "$(dirname "$SPEED_HIST")"
+	echo "$1" | tr -d '\n' | sed 's/"samples":\[[^]]*\]/"samples":[]/g' >> "$SPEED_HIST"
+	echo >> "$SPEED_HIST"
+	n="$(grep -c . "$SPEED_HIST" 2>/dev/null)"
+	if [ "${n:-0}" -gt 320 ]; then grep . "$SPEED_HIST" | tail -n 300 > "$SPEED_HIST.tmp" && mv "$SPEED_HIST.tmp" "$SPEED_HIST"; fi
+}
+speed_hist_get() { # newest first
+	printf '['
+	[ -r "$SPEED_HIST" ] && grep . "$SPEED_HIST" | tail -n 200 | awk '{ l[NR] = $0 } END { for (i = NR; i >= 1; i--) printf "%s%s", l[i], (i > 1 ? "," : "") }'
+	printf ']\n'
+}
+# upload speed: time the router's own POST requests. The counter of the WAN interface also holds
+# every other device's traffic, so it cannot be used for a number that belongs to the test.
+speed_up() { # maxsecs workdir
+	maxs="$1"; w="$2"
+	SP_BYTES=0; SP_SECS=0; SP_UL=""; n=0; size=1000000; tsum=0; bsum=0; ssum=0
+	read up0 _ < /proc/uptime
+	while :; do
+		head -c "$size" /dev/zero > "$w/up.bin" 2>/dev/null
+		read a _ < /proc/uptime
+		if command -v curl >/dev/null 2>&1; then
+			# curl is used when present: uclient-fetch cannot finish a POST on the direct route of some routers
+			curl -s -o /dev/null -m 15 --data-binary @"$w/up.bin" ${UP_URL:-https://speed.cloudflare.com/__up} </dev/null >/dev/null 2>&1 || break
+		else
+			uclient-fetch -q -T 12 -O /dev/null --post-file "$w/up.bin" "${UP_URL:-https://speed.cloudflare.com/__up}" </dev/null >/dev/null 2>&1 || break
+		fi
+		read b _ < /proc/uptime
+		el="$(awk -v a="$a" -v b="$b" 'BEGIN { printf "%.3f", b - a }')"
+		n=$((n + 1))
+		now="$(awk -v z="$size" -v e="$el" 'BEGIN { printf "%.2f", (e > 0) ? z * 8 / e / 1000000 : 0 }')"
+		SP_UL="${SP_UL:+$SP_UL,}$now"
+		# the first request carries the TCP/TLS start-up cost: leave it out of the average when there are more
+		if [ "$n" -gt 1 ] || awk -v t="$(awk -v a="$up0" -v b="$b" 'BEGIN { print b - a }')" -v m="$maxs" 'BEGIN { exit !(t >= m) }'; then
+			bsum=$((bsum + size)); ssum="$(awk -v s="$ssum" -v e="$el" 'BEGIN { printf "%.3f", s + e }')"
+		fi
+		speed_live upload "$now"
+		tot="$(awk -v a="$up0" -v b="$b" 'BEGIN { printf "%.2f", b - a }')"
+		awk -v t="$tot" -v m="$maxs" 'BEGIN { exit !(t >= m) }' && break
+		# aim for requests of about 1.5 s: big enough to hide the start-up cost, small enough to end on time
+		size="$(awk -v v="$now" 'BEGIN { z = v * 1000000 / 8 * 1.5; if (z < 1000000) z = 1000000; if (z > 20000000) z = 20000000; printf "%d", z }')"
+	done
+	read b _ < /proc/uptime
+	SP_SECS="$(awk -v a="$up0" -v b="$b" 'BEGIN { printf "%.2f", b - a }')"
+	SP_BYTES="$bsum"
+	SP_MBPS="$(awk -v z="$bsum" -v e="$ssum" 'BEGIN { printf "%.2f", (e > 0) ? z * 8 / e / 1000000 : 0 }')"
+	rm -f "$w/up.bin"
+}
+# details of the Cloudflare server that carried the test
+speed_srv() { # trace text
+	t="$1"; colo="$(echo "$t" | sed -n 's/^colo=//p' | head -n 1)"
+	sip=""
+	command -v curl >/dev/null 2>&1 && sip="$(curl -s -m 6 -o /dev/null -w '%{remote_ip}' https://speed.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+	[ -n "$sip" ] || sip="$(nslookup speed.cloudflare.com 2>/dev/null | awk '/^Address/ && $NF !~ /#/ && $NF !~ /:/ { a = $NF } END { print a }')"
+	o=""
+	if [ -n "$colo" ]; then
+		o="$(uclient-fetch -q -T 8 -O - https://speed.cloudflare.com/locations 2>/dev/null | tr '{' '\n' | grep "\"iata\":\"$colo\"" | head -n 1 | sed 's/^/{/; s/}.*/}/')"
+	fi
+	g=""; [ -n "$sip" ] && g="$(geo_json "$sip")"
+	lat="$(geo_field "$o" lat | grep -E '^-?[0-9.]+$' || echo null)"; lon="$(geo_field "$o" lon | grep -E '^-?[0-9.]+$' || echo null)"
+	printf '{"host":"speed.cloudflare.com","ip":"%s","colo":"%s","city":"%s","region":"%s","cc":"%s","lat":%s,"lon":%s,"http":"%s","tls":"%s","warp":"%s","gateway":"%s","geo":{' \
+		"$(jesc "$sip")" "$(jesc "$colo")" "$(jesc "$(geo_field "$o" city)")" "$(jesc "$(geo_field "$o" region)")" "$(jesc "$(geo_field "$o" cca2)")" "$lat" "$lon" \
+		"$(jesc "$(echo "$t" | sed -n 's/^http=//p' | head -n 1)")" "$(jesc "$(echo "$t" | sed -n 's/^tls=//p' | head -n 1)")" "$(jesc "$(echo "$t" | sed -n 's/^warp=//p' | head -n 1)")" "$(jesc "$(echo "$t" | sed -n 's/^gateway=//p' | head -n 1)")"
+	geo_obj "$g"
+	printf '}}'
+}
+# details of a server chosen from the list (host, address, place, sponsor)
+speed_srv_custom() {
+	sip=""
+	case "$SP_HOST" in *[!0-9.]*) sip="$(nslookup "$SP_HOST" 2>/dev/null | awk '/^Address/ && $NF !~ /#/ && $NF !~ /:/ { a = $NF } END { print a }')" ;; *) sip="$SP_HOST" ;; esac
+	g=""; [ -n "$sip" ] && g="$(geo_json "$sip")"
+	printf '{"host":"%s","ip":"%s","colo":"","city":"%s","region":"%s","cc":"%s","lat":null,"lon":null,"http":"","tls":"","warp":"","gateway":"","geo":{' \
+		"$(jesc "$SP_HOST")" "$(jesc "$sip")" "$(jesc "$SPEED_SRV_NAME")" "$(jesc "$SPEED_SRV_SPONSOR")" "$(jesc "$SPEED_SRV_CC")"
+	geo_obj "$g"
+	printf '}}'
+}
+speed_run() {
+	SP_DL=""; SP_UL=""; SP_PING=""; SP_LDL=""; SP_COLO=""; SP_LOC=""; SP_IP=""
+	SRV_HOST="speed.cloudflare.com"; PING_HOST="1.1.1.1"; DL_URL="https://speed.cloudflare.com/__down?bytes=25000000"; UP_URL="https://speed.cloudflare.com/__up"; SP_DHOST=""; SP_DEXTRA="1.1.1.1"
+	if [ -n "$SPEED_SRV_URL" ]; then
+		SP_HOST="$(echo "$SPEED_SRV_URL" | sed -n 's|^https\{0,1\}://\([^/:]*\).*|\1|p')"
+		SRV_HOST="$SP_HOST"; PING_HOST="$SP_HOST"; SP_DHOST="$SP_HOST"; SP_DEXTRA=""
+		DL_URL="${SPEED_SRV_URL%/upload.php}/random4000x4000.jpg"; UP_URL="$SPEED_SRV_URL"
+	fi
+	[ "$SPEED_MODE" = direct ] && speed_direct_on
+	dev="$(ip route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+	d="$RUNDIR/sp"; rm -rf "$d"; mkdir -p "$d"
+	speed_live starting 0
+	tr="$(uclient-fetch -q -T 8 -O - https://speed.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+	SP_COLO="$(echo "$tr" | sed -n 's/^colo=//p')"; SP_LOC="$(echo "$tr" | sed -n 's/^loc=//p')"; SP_IP="$(echo "$tr" | sed -n 's/^ip=//p')"
+	if [ -n "$SPEED_SRV_URL" ]; then SP_COLO=""; SP_SRV="$(speed_srv_custom)"; else SP_SRV="$(speed_srv "$tr")"; fi
+	[ -n "$SP_SRV" ] || SP_SRV=null
+	# 1. idle latency and jitter
+	speed_live ping 0
+	ping_run "$PING_HOST" 12 "$d/p0"
+	set -- $(ping_stats "$d/p0" 12)
+	pmin="$1"; pavg="$2"; pmax="$3"; pjit="$4"; ploss="$5"
+	SP_PING="{\"min\":$pmin,\"avg\":$pavg,\"max\":$pmax,\"jitter\":$pjit,\"loss\":$ploss}"
+	# 2. download (the file lives in RAM and is deleted at the end)
+	speed_live download 0
+	speed_dl_start "$d" "$DL_URL" "1 2 3"
+	( ping_run "$PING_HOST" 8 "$d/p1" ) </dev/null >/dev/null 2>&1 &
+	# the loop below ends when the time is up (10 s) or every stream has stopped
+	speed_dir download 0 10 dl "$d"
+	speed_dl_stop "$d"
+	dbytes="$SP_BYTES"; dsecs="$SP_SECS"; dmbps="$SP_MBPS"
+	rm -f "$d"/dl.* "$d"/done.* "$d"/pid.*
+	wait
+	set -- $(ping_stats "$d/p1" 8)
+	[ "$2" != 0 ] && SP_LDL="$2"
+	ldl="${SP_LDL:-null}"
+	# 3. upload (the router times its own requests)
+	umbps=0; ubytes=0; usecs=0; lul=null
+	speed_live upload 0
+	( ping_run "$PING_HOST" 8 "$d/p2" ) </dev/null >/dev/null 2>&1 &
+	speed_up 8 "$d"
+	umbps="$SP_MBPS"; ubytes="$SP_BYTES"; usecs="$SP_SECS"
+	# no upload request finished: say so (shown as "-") instead of a misleading 0.00
+	[ "${ubytes:-0}" -gt 0 ] 2>/dev/null || umbps=null
+	wait
+	set -- $(ping_stats "$d/p2" 8)
+	[ "$2" != 0 ] && lul="$2"
+	rm -rf "$d"
+	[ "$SPEED_MODE" = direct ] && speed_direct_off
+	if [ "${dbytes:-0}" -lt 100000 ]; then
+		printf '{"state":"error","bytes":%d}\n' "${dbytes:-0}"
+		[ "$SPEED_AUTO" = 1 ] && speed_hist_add "$(printf '{"state":"failed","auto":true,"ts":%s,"mode":"%s","down":{"mbps":null},"up":{"mbps":null},"ping":null,"time":"%s"}' "$(date +%s)" "${SPEED_MODE:-proxy}" "$(date '+%H:%M:%S')")"
+		return
+	fi
+	res="$(printf '{"state":"done","ts":%s,"mode":"%s","server":"%s","srv":%s,"colo":"%s","loc":"%s","ip":"%s","ping":%s,"down":{"mbps":%s,"bytes":%d,"seconds":%s,"loaded_ms":%s,"samples":[%s]},"up":{"mbps":%s,"bytes":%d,"seconds":%s,"loaded_ms":%s,"samples":[%s]},"time":"%s"}\n' \
+		"$(date +%s)" "${SPEED_MODE:-proxy}" "$(jesc "$SRV_HOST")" "${SP_SRV:-null}" "$(jesc "$SP_COLO")" "$(jesc "$SP_LOC")" "$(jesc "$SP_IP")" "$SP_PING" "${dmbps:-0}" "${dbytes:-0}" "${dsecs:-0}" "$ldl" "$SP_DL" \
+		"${umbps:-0}" "${ubytes:-0}" "${usecs:-0}" "$lul" "$SP_UL" "$(date '+%H:%M:%S')")"
+	[ "$SPEED_AUTO" = 1 ] && res="$(echo "$res" | sed 's/"state":"done",/"state":"done","auto":true,/')"
+	echo "$res"
+	speed_hist_add "$res"
+}
+# speed-servers COUNTRY [CC]: the public test servers of one country (list from speedtest.net)
+cmd_speed_servers() {
+	q="$1"; cc="$2"
+	case "$q" in ''|*[!A-Za-z\ .\'\&-]*) echo '[]'; return ;; esac
+	case "$cc" in ''|[A-Za-z][A-Za-z]) ;; *) cc="" ;; esac
+	u="https://www.speedtest.net/api/js/servers?engine=js&limit=100&search=$(echo "$q" | sed 's/ /%20/g')"
+	if command -v curl >/dev/null 2>&1; then raw="$(curl -s -m 15 "$u" 2>/dev/null)"; else raw="$(uclient-fetch -q -T 15 -O - "$u" 2>/dev/null)"; fi
+	printf '['
+	printf '%s\n' "$raw" | tr '{' '\n' | sed -n 's/^"url":"\([^"]*upload\.php\)".*"name":"\([^"]*\)","country":"\([^"]*\)","cc":"\([^"]*\)","sponsor":"\([^"]*\)","id":"\([^"]*\)".*/\1|\2|\4|\5|\6/p' | sed 's|\\/|/|g' | \
+		awk -F'|' -v cc="$(echo "$cc" | tr 'a-z' 'A-Z')" 'cc == "" || $3 == cc { printf "%s{\"url\":\"%s\",\"name\":\"%s\",\"cc\":\"%s\",\"sponsor\":\"%s\",\"id\":\"%s\"}", (n++ ? "," : ""), $1, $2, $3, $4, $5; if (n >= 60) exit }'
+	printf ']\n'
+}
+cmd_router_speed() {
+	case "$1" in
+		start)
+			rm -f "$RUNDIR/speed.live"; SPEED_MODE=proxy; [ "$2" = direct ] && SPEED_MODE=direct
+			SPEED_SRV_URL=""; SPEED_SRV_CC=""; SPEED_SRV_NAME=""; SPEED_SRV_SPONSOR=""
+			if [ -n "$3" ]; then
+				echo "$3" | grep -Eq '^https?://[A-Za-z0-9._-]+(:[0-9]{1,5})?/[A-Za-z0-9._/-]*upload\.php$' || { echo "not a valid test server address" >&2; exit 1; }
+				SPEED_SRV_URL="$3"; SPEED_SRV_CC="$4"; SPEED_SRV_NAME="$5"; SPEED_SRV_SPONSOR="$6"
+			fi
+			bg_job speed speed_run ;;
+		history) speed_hist_get ;;
+		history-clear) rm -f "$SPEED_HIST"; echo '[]' ;;
+		status)
+			if [ -r "$RUNDIR/speed.json" ] && grep -q '"state":"running"' "$RUNDIR/speed.json" && [ -r "$RUNDIR/speed.live" ]; then cat "$RUNDIR/speed.live"
+			else bg_status speed; fi ;;
+		*) echo "usage: router-speed start [direct|proxy [SERVER_URL CC CITY SPONSOR]]|status|history|history-clear" >&2; exit 1 ;;
+	esac
+}
+
+# which resolver address does the Internet see when this router asks a question?
+tmo() { # secs command... (BusyBox timeout when it exists)
+	if command -v timeout >/dev/null 2>&1; then timeout "$@"; else shift; "$@"; fi
+}
+resolver_via() { # [server]
+	r="$(tmo 4 nslookup -type=TXT o-o.myaddr.l.google.com $1 2>/dev/null)"
+	ip="$(echo "$r" | grep -o '"[0-9a-fA-F:.]\{7,\}"' | tr -d '"' | head -n 1)"
+	[ -n "$ip" ] || ip="$(tmo 3 nslookup whoami.akamai.net $1 2>/dev/null | awk '/^Address/ { a = $NF } END { print a }')"
+	case "$ip" in *#*|127.*|'::1') ip="" ;; esac
+	echo "$ip"
+}
+geo_json() { # ip (empty = this connection)
+	uclient-fetch -q -T 8 -O - "http://ip-api.com/json/$1?fields=status,message,continent,country,countryCode,regionName,city,district,zip,lat,lon,timezone,offset,currency,isp,org,as,asname,reverse,mobile,proxy,hosting,query" 2>/dev/null
+}
+geo_field() { jsonfilter -s "$1" -e "@.$2" 2>/dev/null; }
+geo_obj() { # json -> the fields of one location
+	g="$1"
+	printf '"ip":"%s","country":"%s","cc":"%s","continent":"%s","region":"%s","city":"%s","district":"%s","zip":"%s","lat":%s,"lon":%s,"tz":"%s","offset":%s,"currency":"%s","isp":"%s","org":"%s","as":"%s","asname":"%s","reverse":"%s","mobile":%s,"proxy":%s,"hosting":%s' \
+		"$(jesc "$(geo_field "$g" query)")" "$(jesc "$(geo_field "$g" country)")" "$(jesc "$(geo_field "$g" countryCode)")" "$(jesc "$(geo_field "$g" continent)")" \
+		"$(jesc "$(geo_field "$g" regionName)")" "$(jesc "$(geo_field "$g" city)")" "$(jesc "$(geo_field "$g" district)")" "$(jesc "$(geo_field "$g" zip)")" \
+		"$(geo_field "$g" lat | grep -E '^-?[0-9.]+$' || echo null)" "$(geo_field "$g" lon | grep -E '^-?[0-9.]+$' || echo null)" \
+		"$(jesc "$(geo_field "$g" timezone)")" "$(geo_field "$g" offset | grep -E '^-?[0-9]+$' || echo null)" "$(jesc "$(geo_field "$g" currency)")" \
+		"$(jesc "$(geo_field "$g" isp)")" "$(jesc "$(geo_field "$g" org)")" \
+		"$(jesc "$(geo_field "$g" as)")" "$(jesc "$(geo_field "$g" asname)")" "$(jesc "$(geo_field "$g" reverse)")" \
+		"$(geo_field "$g" mobile | grep -E '^(true|false)$' || echo false)" "$(geo_field "$g" proxy | grep -E '^(true|false)$' || echo false)" \
+		"$(geo_field "$g" hosting | grep -E '^(true|false)$' || echo false)"
+}
+# one lookup per address and per run (the free service allows about 45 a minute)
+geo_cached() { # ip -> json
+	[ -n "$1" ] || { geo_json ""; return; }
+	cf="$LEAKDIR/g.$(echo "$1" | tr ':.' '__')"
+	[ -s "$cf" ] || geo_json "$1" > "$cf" 2>/dev/null
+	cat "$cf"
+}
+leak_step() { echo "$1" > "$RUNDIR/leak.step"; }
+# the resolver and the latency of one DNS server, in the background: files $LEAKDIR/r.N and $LEAKDIR/m.N
+leak_probe() { # n server
+	( resolver_via "$2" > "$LEAKDIR/r.$1" ) </dev/null >/dev/null 2>&1 &
+	if [ -n "$2" ]; then
+		( ping_run "$2" 3 "$LEAKDIR/p.$1"; set -- "$1" $(ping_stats "$LEAKDIR/p.$1" 3); echo "$3" > "$LEAKDIR/m.$1" ) </dev/null >/dev/null 2>&1 &
+	fi
+}
+leak_item() { # n label server
+	ip="$(cat "$LEAKDIR/r.$1" 2>/dev/null)"
+	ms="$(cat "$LEAKDIR/m.$1" 2>/dev/null)"
+	if [ -n "$ip" ]; then g="$(geo_cached "$ip")"; else g=""; fi
+	printf '{"via":"%s","server":"%s","ms":%s,' "$(jesc "$2")" "$(jesc "$3")" "$( [ -n "$ms" ] && [ "$ms" != 0.0 ] && echo "$ms" || echo null )"
+	geo_obj "$g"
+	printf '}'
+}
+# what the bash.ws service sees when this router asks for a handful of unique names (finds every resolver in use)
+leak_ext() {
+	f="curl -s -m 5"; command -v curl >/dev/null 2>&1 || f="uclient-fetch -q -T 5 -O -"
+	id="$($f https://bash.ws/id 2>/dev/null | tr -cd 'a-zA-Z0-9')"
+	[ -n "$id" ] || { printf '{"ok":false}'; return; }
+	i=1; while [ $i -le 5 ]; do ( tmo 3 nslookup "$i.$id.bash.ws" >/dev/null 2>&1 ) </dev/null >/dev/null 2>&1 & i=$((i+1)); done
+	wait; sleep 1
+	j="$($f "https://bash.ws/dnsleak/test/$id?json" 2>/dev/null)"
+	printf '{"ok":true,"resolvers":['
+	i=0; first=1; seen=" "
+	while [ $i -lt 40 ]; do
+		t="$(jsonfilter -s "$j" -e "@[$i].type" 2>/dev/null)"; [ -n "$t" ] || break
+		if [ "$t" = dns ]; then
+			ip="$(jsonfilter -s "$j" -e "@[$i].ip" 2>/dev/null)"
+			case "$seen" in *" $ip "*) ;; *)
+				seen="$seen$ip "
+				[ "$first" = 1 ] || printf ','
+				first=0
+				printf '{'; geo_obj "$(geo_cached "$ip")"; printf '}' ;;
+			esac
+		fi
+		i=$((i+1))
+	done
+	printf ']}'
+}
+leak_cfg() {
+	srv="$(uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | tr '\n' ' ')"
+	opt="$(uci -q get dhcp.lan.dhcp_option 2>/dev/null | tr '\n' ' ')"
+	nores="$(uci -q get dhcp.@dnsmasq[0].noresolv 2>/dev/null)"
+	l53="$(netstat -lnup 2>/dev/null | awk '$4 ~ /:53$/ { n = split($NF, a, "/"); print a[n] }' | sort -u | tr '\n' ' ')"
+	hij="$(nft list ruleset 2>/dev/null | grep -E 'dport (\{ *)?53' | grep -cE 'redirect|dnat|tproxy|queue' )"
+	tools="$(ps 2>/dev/null | grep -oE 'https-dns-proxy|stubby|dnscrypt-proxy|smartdns|AdGuardHome|chinadns-ng|dns2socks|sing-box|xray|dnsmasq' | sort -u | tr '\n' ' ')"
+	printf '{"servers":"%s","dhcp_dns":"%s","noresolv":"%s","listen53":"%s","redirect_rules":%s,"software":"%s"}' "$(jesc "$srv")" "$(jesc "$opt")" "$(jesc "$nores")" "$(jesc "$l53")" "${hij:-0}" "$(jesc "$tools")"
+}
+leak_run() {
+	LEAKDIR="$RUNDIR/leak"; rm -rf "$LEAKDIR"; mkdir -p "$LEAKDIR"
+	leak_step "Asking the DNS servers who they are"
+	leak_probe 0 ""
+	leak_probe 1 1.1.1.1; leak_probe 2 8.8.8.8
+	[ "$LEAK_MODE" = quick ] || { leak_probe 3 9.9.9.9; leak_probe 4 208.67.222.222; }
+	leak_step "Finding your public address"
+	me="$(geo_json "")"
+	tr="$(uclient-fetch -q -T 6 -O - https://speed.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
+	cfv() { echo "$tr" | sed -n "s/^$1=//p" | head -n 1; }
+	# IPv6: a global address on this router and the address the internet sees over IPv6
+	v6a="$(ip -6 addr show scope global 2>/dev/null | awk '/inet6/ { print $2; exit }' | sed 's#/.*##')"
+	v6r="$(ip -6 route show default 2>/dev/null | head -n 1)"
+	v6p=""
+	if [ -n "$v6a" ] && [ "$LEAK_MODE" != quick ]; then v6p="$(curl -s -6 -m 4 https://api6.ipify.org 2>/dev/null || uclient-fetch -6 -q -T 4 -O - https://api6.ipify.org 2>/dev/null)"; fi
+	wait
+	leak_step "Looking up the resolvers"
+	printf '{"state":"done","public":{'
+	geo_obj "$me"
+	printf ',"cf_colo":"%s","cf_loc":"%s","cf_warp":"%s","cf_http":"%s","cf_tls":"%s"' "$(jesc "$(cfv colo)")" "$(jesc "$(cfv loc)")" "$(jesc "$(cfv warp)")" "$(jesc "$(cfv http)")" "$(jesc "$(cfv tls)")"
+	printf '},'
+	if [ "$LEAK_MODE" = quick ]; then printf '"v6":null,'; else
+		printf '"v6":{"address":"%s","has_route":%s,"public":"%s"' "$(jesc "$v6a")" "$( [ -n "$v6r" ] && echo true || echo false )" "$(jesc "$v6p")"
+		[ -n "$v6p" ] && { printf ','; geo_obj "$(geo_cached "$v6p")"; }
+		printf '},'
+	fi
+	printf '"mode":"%s","tests":[' "${LEAK_MODE:-extended}"
+	leak_item 0 "Router DNS (what your devices use)" ""
+	printf ','; leak_item 1 "Direct to 1.1.1.1 (Cloudflare)" "1.1.1.1"
+	printf ','; leak_item 2 "Direct to 8.8.8.8 (Google)" "8.8.8.8"
+	if [ "$LEAK_MODE" != quick ]; then
+		printf ','; leak_item 3 "Direct to 9.9.9.9 (Quad9)" "9.9.9.9"
+		printf ','; leak_item 4 "Direct to 208.67.222.222 (OpenDNS)" "208.67.222.222"
+	fi
+	printf '],"upstream":['
+	first=1
+	for u in $( { sed -n 's/^nameserver[ \t]*//p' /tmp/resolv.conf.d/resolv.conf.auto /tmp/resolv.conf.auto 2>/dev/null; uci -q get dhcp.@dnsmasq[0].server 2>/dev/null | tr ' ' '\n'; } | sed 's#.*/##; s/#.*//' | grep -E '^[0-9a-fA-F.:]+$' | grep -v '^127\.' | awk '!s[$0]++' | head -n 4); do
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"server":"%s",' "$(jesc "$u")"
+		geo_obj "$(geo_cached "$u")"
+		printf '}'
+	done
+	printf '],"config":'
+	leak_cfg
+	if [ "$LEAK_MODE" = quick ]; then printf ',"extended":null'; else
+		leak_step "Looking for every resolver in use"
+		printf ',"extended":'
+		leak_ext
+	fi
+	printf ',"time":"%s","date":"%s"}\n' "$(date '+%H:%M:%S')" "$(date '+%Y-%m-%d')"
+	rm -f "$RUNDIR/leak.step"
+}
+cmd_router_dnsleak() {
+	case "$1" in
+		start) rm -f "$RUNDIR/leak.step"; LEAK_MODE=extended; [ "$2" = quick ] && LEAK_MODE=quick; bg_job leak leak_run ;;
+		status)
+			if [ -r "$RUNDIR/leak.json" ] && grep -q '"state":"running"' "$RUNDIR/leak.json" && [ -r "$RUNDIR/leak.step" ]; then
+				printf '{"state":"running","step":"%s"}\n' "$(jesc "$(cat "$RUNDIR/leak.step")")"
+			else bg_status leak; fi ;;
+		*) echo "usage: router-dnsleak start|status" >&2; exit 1 ;;
+	esac
+}
+
+# router-sched-reboot HH:MM [DOW|*]   or   router-sched-reboot off
+cmd_router_sched() {
+	mkdir -p "$RUNDIR"
+	touch "$CRON_FILE"
+	tmp="$RUNDIR/cron.$$"
+	grep -vF "$CRON_TAG" "$CRON_FILE" > "$tmp"
+	if [ "$1" != off ]; then
+		case "$1" in [0-2][0-9]:[0-5][0-9]) ;; *) echo "invalid time" >&2; rm -f "$tmp"; exit 1 ;; esac
+		h="${1%%:*}"; m="${1##*:}"; h="${h#0}"; m="${m#0}"
+		[ "${h:-0}" -le 23 ] || { echo "invalid time" >&2; rm -f "$tmp"; exit 1; }
+		d="${2:-*}"
+		case "$d" in '*'|[0-6]) ;; *) echo "invalid day" >&2; rm -f "$tmp"; exit 1 ;; esac
+		echo "${m:-0} ${h:-0} * * $d /sbin/reboot $CRON_TAG" >> "$tmp"
+	fi
+	cp "$tmp" "$CRON_FILE"; rm -f "$tmp"
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+	echo ok
+}
+sched_json() {
+	l="$(grep -F "$CRON_TAG" "$CRON_FILE" 2>/dev/null | head -n 1)"
+	if [ -n "$l" ]; then
+		echo "$l" | awk '{ printf "{\"time\":\"%02d:%02d\",\"dow\":\"%s\"}", $2, $1, $5 }'
+	else
+		printf 'null'
+	fi
+}
+
+# ---- Multi-WAN (mwan3): failover or load balancing between uplinks ----
+mw_present() { [ -x /usr/sbin/mwan3 ] || [ -f /etc/init.d/mwan3 ]; }
+mw_json_sections() { # type -> JSON array of the sections of that type (options as strings, lists as arrays)
+	uci -q show mwan3 2>/dev/null | awk -v want="$1" '
+		function unq(v) { sub(/^\047/, "", v); sub(/\047$/, "", v); return v }
+		function esc(v) { gsub(/\\/, "\\\\", v); gsub(/"/, "\\\"", v); return v }
+		function lst(v,   a, n, i, o) { n = split(v, a, /\047 \047/); o = ""; for (i = 1; i <= n; i++) o = o (i > 1 ? "," : "") "\"" esc(unq(a[i])) "\""; return "[" o "]" }
+		{ key = $0; sub(/=.*/, "", key); val = $0; sub(/^[^=]*=/, "", val); n = split(key, k, ".")
+		  if (n == 2) { ty[k[2]] = val; ord[++c] = k[2]; next }
+		  if (n == 3) { o[k[2]] = o[k[2]] (o[k[2]] == "" ? "" : ",") "\"" k[3] "\":" ((k[3] == "track_ip" || k[3] == "use_member") ? lst(val) : "\"" esc(unq(val)) "\"") } }
+		END { printf "["; f = 1
+			for (i = 1; i <= c; i++) { s = ord[i]; if (ty[s] != want) continue
+				printf "%s{\"name\":\"%s\"%s%s}", (f ? "" : ","), s, (o[s] == "" ? "" : ","), o[s]; f = 0 }
+			printf "]" }'
+}
+cmd_mwan_info() {
+	inst=false; run=false; en=false
+	mw_present && inst=true
+	[ -f /etc/rc.d/S*mwan3 ] 2>/dev/null && en=true
+	pidof mwan3track >/dev/null 2>&1 && run=true
+	ver=""; if [ "$inst" = true ]; then ver="$(sed -n 's/^Version: //p' /usr/lib/opkg/info/mwan3.control 2>/dev/null | head -n 1)"; [ -n "$ver" ] || ver="$(apk info -v mwan3 2>/dev/null | head -n 1; true)"; fi
+	printf '{"installed":%s,"running":%s,"enabled":%s,"version":"%s","interfaces":' "$inst" "$run" "$en" "$(jesc "$ver")"
+	if [ "$inst" = true ]; then mw_json_sections interface; else printf '[]'; fi
+	printf ',"members":'; [ "$inst" = true ] && mw_json_sections member || printf '[]'
+	printf ',"policies":'; [ "$inst" = true ] && mw_json_sections policy || printf '[]'
+	printf ',"rules":'; [ "$inst" = true ] && mw_json_sections rule || printf '[]'
+	printf ',"status":{'
+	st="$(ubus call mwan3 status '{"section":"interfaces"}' 2>/dev/null)"
+	first=1
+	for n in $(uci -q show mwan3 2>/dev/null | sed -n 's/^mwan3\.\([A-Za-z0-9_]*\)=interface$/\1/p'); do
+		v="$(jsonfilter -s "$st" -e "@.interfaces.$n.status" 2>/dev/null)"; u="$(jsonfilter -s "$st" -e "@.interfaces.$n.uptime" 2>/dev/null)"
+		[ "$first" = 1 ] || printf ','; first=0
+		printf '"%s":{"status":"%s","uptime":%s}' "$n" "$(jesc "$v")" "${u:-0}"
+	done
+	printf '},"candidates":['
+	first=1
+	for n in $(uci -q show network 2>/dev/null | sed -n 's/^network\.\([A-Za-z0-9_]*\)=interface$/\1/p'); do
+		case "$n" in loopback|lan|*6) continue ;; esac
+		[ "$first" = 1 ] || printf ','; first=0
+		ist="$(ifstatus "$n" 2>/dev/null)"
+		printf '{"name":"%s","proto":"%s","up":%s,"device":"%s"}' "$n" "$(jesc "$(uci -q get network.$n.proto)")" "$(jsonfilter -s "$ist" -e '@.up' 2>/dev/null || echo false)" "$(jesc "$(jsonfilter -s "$ist" -e '@.l3_device' 2>/dev/null)")"
+	done
+	printf ']}\n'
+}
+mw_num() { case "$1" in ''|*[!0-9]*) return 1 ;; *) [ "$1" -ge 0 ] && [ "$1" -le 3600 ] ;; esac }
+mw_ensure_iface() { # name
+	n="$1"
+	[ "$(uci -q get mwan3.$n)" = interface ] && return 0
+	uci set mwan3.$n=interface
+	uci set mwan3.$n.enabled=1; uci set mwan3.$n.family=ipv4
+	uci add_list mwan3.$n.track_ip=1.1.1.1; uci add_list mwan3.$n.track_ip=8.8.8.8
+	uci set mwan3.$n.track_method=ping; uci set mwan3.$n.reliability=1; uci set mwan3.$n.count=1
+	uci set mwan3.$n.timeout=2; uci set mwan3.$n.interval=5; uci set mwan3.$n.down=3; uci set mwan3.$n.up=3
+}
+# mwan-iface-set IFACE KEY=VALUE... : tracking settings of one uplink
+cmd_mwan_iface_set() {
+	n="$1"; shift
+	case "$n" in ''|*[!A-Za-z0-9_]*) echo "invalid interface" >&2; exit 1 ;; esac
+	mw_present || { echo "mwan3 is not installed" >&2; exit 1; }
+	mw_ensure_iface "$n"
+	for kv in "$@"; do
+		k="${kv%%=*}"; v="${kv#*=}"
+		case "$k" in
+			enabled) [ "$v" = 0 ] || v=1; uci set mwan3.$n.enabled="$v" ;;
+			track_method) case "$v" in ping|httping|arping|nslookup) uci set mwan3.$n.track_method="$v" ;; *) echo "invalid method" >&2; exit 1 ;; esac ;;
+			reliability|count|timeout|interval|down|up) mw_num "$v" || { echo "invalid number for $k" >&2; exit 1; }; uci set mwan3.$n.$k="$v" ;;
+			track_ip)
+				uci -q delete mwan3.$n.track_ip
+				for h in $(echo "$v" | tr ',' ' '); do
+					case "$h" in ''|*[!A-Za-z0-9.:_-]*) echo "invalid host" >&2; exit 1 ;; esac
+					uci add_list mwan3.$n.track_ip="$h"
+				done ;;
+			*) echo "unknown setting $k" >&2; exit 1 ;;
+		esac
+	done
+	uci commit mwan3
+	echo ok
+}
+# mwan-setup failover|balance IF[:WEIGHT]... : build the oDash pool (members, policy, catch-all rule) and restart mwan3
+cmd_mwan_setup() {
+	mode="$1"; shift
+	case "$mode" in failover|balance) ;; *) echo "mode must be failover or balance" >&2; exit 1 ;; esac
+	[ $# -ge 1 ] || { echo "choose at least one interface" >&2; exit 1; }
+	mw_present || { echo "mwan3 is not installed" >&2; exit 1; }
+	for x in "$@"; do case "${x%%:*}" in ''|*[!A-Za-z0-9_]*) echo "invalid interface" >&2; exit 1 ;; esac; done
+	# remove what an earlier setup made
+	for sct in $(uci -q show mwan3 | sed -n 's/^mwan3\.\(od_[A-Za-z0-9_]*\)=.*/\1/p'); do uci -q delete mwan3.$sct; done
+	m=1; mem=""
+	for x in "$@"; do
+		n="${x%%:*}"; w="${x#*:}"; [ "$w" = "$x" ] && w=1; mw_num "$w" && [ "$w" -ge 1 ] || w=1
+		mw_ensure_iface "$n"; uci set mwan3.$n.enabled=1
+		uci set mwan3.od_m_$n=member; uci set mwan3.od_m_$n.interface="$n"
+		if [ "$mode" = failover ]; then uci set mwan3.od_m_$n.metric="$m"; uci set mwan3.od_m_$n.weight=1
+		else uci set mwan3.od_m_$n.metric=1; uci set mwan3.od_m_$n.weight="$w"; fi
+		mem="$mem od_m_$n"; m=$((m + 1))
+	done
+	uci set mwan3.od_policy=policy
+	for x in $mem; do uci add_list mwan3.od_policy.use_member="$x"; done
+	uci set mwan3.od_policy.last_resort=default
+	uci set mwan3.od_default=rule; uci set mwan3.od_default.dest_ip=0.0.0.0/0; uci set mwan3.od_default.family=ipv4; uci set mwan3.od_default.use_policy=od_policy
+	uci reorder mwan3.od_default=0
+	uci set mwan3.od_default.sticky=0
+	uci commit mwan3
+	( /etc/init.d/mwan3 enable; /etc/init.d/mwan3 restart ) >/dev/null 2>&1 </dev/null &
+	echo ok
+}
+cmd_mwan_service() {
+	mw_present || { echo "mwan3 is not installed" >&2; exit 1; }
+	case "$1" in
+		on) ( /etc/init.d/mwan3 enable; /etc/init.d/mwan3 restart ) >/dev/null 2>&1 </dev/null & ;;
+		off) ( /etc/init.d/mwan3 stop; /etc/init.d/mwan3 disable ) >/dev/null 2>&1 </dev/null & ;;
+		*) echo "usage: mwan-service on|off" >&2; exit 1 ;;
+	esac
+	echo ok
+}
+mw_install_run() {
+	if command -v apk >/dev/null 2>&1; then apk update >/dev/null 2>&1; apk add mwan3 >/dev/null 2>&1 || { echo '{"state":"error"}'; return; }
+	else opkg update >/dev/null 2>&1; opkg install mwan3 >/dev/null 2>&1 || { echo '{"state":"error"}'; return; }; fi
+	mw_present && echo '{"state":"done"}' || echo '{"state":"error"}'
+}
+cmd_mwan_install() {
+	case "$1" in start) bg_job mwan_inst mw_install_run ;; status) bg_status mwan_inst ;; *) echo "usage: mwan-install start|status" >&2; exit 1 ;; esac
+}
+
+# ---- device time schedules: block a device during a window, or allow it only during a window ----
+# rules in /etc/odash/devsched, one per line: mac|block or allow|days (0=Sunday..6, or *)|from|to|on(0/1); cron runs "dsched-run" every minute
+DSCH_FILE="${ODASH_DSCHED:-/etc/odash/devsched}"
+DSCH_TAG="# odash-devsched"
+dsch_blocked_now() { # MACs that the schedules cut off right now
+	[ -r "$DSCH_FILE" ] || return 0
+	awk -F'|' -v nt="$(date +%H:%M)" -v nd="$(date +%w)" '
+		function inday(d, days) { return days == "*" || index("," days ",", "," d ",") > 0 }
+		function act(days, f, t,   pd) { pd = (nd + 6) % 7; if (f == t) return inday(nd, days); if (f < t) return inday(nd, days) && nt >= f && nt < t; return (inday(nd, days) && nt >= f) || (inday(pd, days) && nt < t) }
+		$6 == "1" && $1 != "" { m = $1; seen[m] = 1; if ($2 == "allow") { ha[m] = 1; if (act($3, $4, $5)) aa[m] = 1 } else if (act($3, $4, $5)) ba[m] = 1 }
+		END { for (m in seen) if (ba[m] || (ha[m] && !aa[m])) print m }' "$DSCH_FILE"
+}
+dsch_manual() { # is the device blocked by hand?
+	sec="$(uci_find odash device "$1")"
+	[ -n "$sec" ] && [ "$(uci -q get "odash.$sec.blocked")" = 1 ]
+}
+dsch_apply() {
+	mkdir -p "$RUNDIR"; touch "$CRON_FILE"
+	tmp="$RUNDIR/cron.ds.$$"
+	grep -vF "$DSCH_TAG" "$CRON_FILE" > "$tmp"
+	if [ -r "$DSCH_FILE" ] && grep -q '|1$' "$DSCH_FILE"; then echo "* * * * * /usr/bin/odash dsched-run $DSCH_TAG" >> "$tmp"; fi
+	cp "$tmp" "$CRON_FILE"; rm -f "$tmp"
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+cmd_dsched_run() {
+	mkdir -p "$STATE"
+	new="$(dsch_blocked_now | sort | tr '\n' ' ')"; old="$(cat "$STATE/dsched.cur" 2>/dev/null)"
+	for m in $new; do nft add element inet "$TABLE" blocked "{ $m }" 2>/dev/null; done
+	for m in $old; do
+		case " $new " in *" $m "*) continue ;; esac
+		dsch_manual "$m" || nft delete element inet "$TABLE" blocked "{ $m }" 2>/dev/null
+	done
+	echo "$new" > "$STATE/dsched.cur"
+}
+cmd_dsched_get() {
+	printf '{"time":"%s","day":%s,"rules":[' "$(date '+%H:%M')" "$(date +%w)"
+	first=1
+	[ -r "$DSCH_FILE" ] && while IFS='|' read -r mac mode days t1 t2 on; do
+		[ -n "$mac" ] || continue
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"mac":"%s","mode":"%s","days":"%s","from":"%s","to":"%s","on":%s}' "$mac" "$mode" "$days" "$t1" "$t2" "$([ "$on" = 1 ] && echo true || echo false)"
+	done < "$DSCH_FILE"
+	printf '],"active":['
+	first=1
+	for m in $(dsch_blocked_now | sort); do [ "$first" = 1 ] || printf ','; first=0; printf '"%s"' "$m"; done
+	printf ']}\n'
+}
+# dsched-set MAC [mode|days|from|to|on ...] : replace the rules of one device (no rules = remove them all)
+cmd_dsched_set() {
+	mac="$(echo "$1" | tr 'A-F' 'a-f')"; shift
+	valid_mac "$mac" || { echo "invalid MAC address" >&2; exit 1; }
+	[ $# -le 8 ] || { echo "at most 8 rules per device" >&2; exit 1; }
+	mkdir -p "$(dirname "$DSCH_FILE")"
+	tmp="$DSCH_FILE.tmp"
+	[ -r "$DSCH_FILE" ] && grep -v "^$mac|" "$DSCH_FILE" > "$tmp" || : > "$tmp"
+	for r in "$@"; do
+		mode="$(echo "$r" | cut -d'|' -f1)"; days="$(echo "$r" | cut -d'|' -f2)"; t1="$(echo "$r" | cut -d'|' -f3)"; t2="$(echo "$r" | cut -d'|' -f4)"; on="$(echo "$r" | cut -d'|' -f5)"
+		case "$mode" in block|allow) ;; *) rm -f "$tmp"; echo "invalid rule" >&2; exit 1 ;; esac
+		sched_valid_days "$days" && sched_valid_time "$t1" && sched_valid_time "$t2" || { rm -f "$tmp"; echo "invalid rule" >&2; exit 1; }
+		[ "$on" = 0 ] || on=1
+		printf '%s|%s|%s|%s|%s|%s\n' "$mac" "$mode" "$days" "$t1" "$t2" "$on" >> "$tmp"
+	done
+	mv "$tmp" "$DSCH_FILE"
+	[ -s "$DSCH_FILE" ] || rm -f "$DSCH_FILE"
+	dsch_apply; cmd_dsched_run
+	echo ok
+}
+
+# ---- schedules: reboot, Wi-Fi off / on / quiet hours (rules in /etc/odash/schedules, cron lines tagged "# odash-sched") ----
+SCHED_FILE="${ODASH_SCHEDULES:-/etc/odash/schedules}"
+SCHED_TAG="# odash-sched"
+sched_valid_time() { case "$1" in [0-2][0-9]:[0-5][0-9]) [ "${1%%:*}" -le 23 ] 2>/dev/null ;; *) return 1 ;; esac; }
+sched_valid_days() { case "$1" in '*') return 0 ;; ''|*[!0-6,]*|,*|*,|*,,*) return 1 ;; *) return 0 ;; esac; }
+sched_dow_next() { # "1,3" -> "2,4"
+	[ "$1" = '*' ] && { echo '*'; return; }
+	echo "$1" | tr ',' '\n' | awk '{ printf "%s%d", (NR > 1 ? "," : ""), ($1 + 1) % 7 } END { print "" }'
+}
+sched_cron_line() { # time days action
+	h="${1%%:*}"; m="${1##*:}"; h="${h#0}"; m="${m#0}"
+	echo "${m:-0} ${h:-0} * * $2 /usr/bin/odash router-sched-run $3 $SCHED_TAG"
+}
+sched_apply() {
+	mkdir -p "$RUNDIR"; touch "$CRON_FILE"
+	tmp="$RUNDIR/cron.$$"
+	grep -vF "$SCHED_TAG" "$CRON_FILE" > "$tmp"
+	[ -r "$SCHED_FILE" ] && while IFS='|' read -r id act days t1 t2 on; do
+		[ "$on" = 1 ] || continue
+		case "$act" in
+			reboot) sched_cron_line "$t1" "$days" reboot >> "$tmp" ;;
+			wifi_off) sched_cron_line "$t1" "$days" wifi-off >> "$tmp" ;;
+			wifi_on) sched_cron_line "$t1" "$days" wifi-on >> "$tmp" ;;
+			wifi_window)
+				sched_cron_line "$t1" "$days" wifi-off >> "$tmp"
+				d2="$days"; [ "$t2" \> "$t1" ] || d2="$(sched_dow_next "$days")"
+				sched_cron_line "$t2" "$d2" wifi-on >> "$tmp" ;;
+		esac
+	done < "$SCHED_FILE"
+	cp "$tmp" "$CRON_FILE"; rm -f "$tmp"
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+# take over the old single "scheduled reboot" line of earlier versions
+sched_migrate() {
+	l="$(grep -F "$CRON_TAG" "$CRON_FILE" 2>/dev/null | head -n 1)"
+	[ -n "$l" ] || return 0
+	t="$(echo "$l" | awk '{ printf "%02d:%02d", $2, $1 }')"; d="$(echo "$l" | awk '{ print $5 }')"
+	mkdir -p "$(dirname "$SCHED_FILE")"
+	echo "1|reboot|$d|$t||1" >> "$SCHED_FILE"
+	grep -vF "$CRON_TAG" "$CRON_FILE" > "$RUNDIR/cron.m" 2>/dev/null; cp "$RUNDIR/cron.m" "$CRON_FILE"; rm -f "$RUNDIR/cron.m"
+	sched_apply
+}
+wifi_ap_list() { uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)\.mode=.ap.$/\1/p'; }
+wifi_state() { # prints "<aps> <disabled aps>"
+	n=0; o=0
+	for s in $(wifi_ap_list); do
+		n=$((n + 1))
+		[ "$(uci -q get wireless.$s.disabled)" = 1 ] && o=$((o + 1))
+	done
+	echo "$n $o"
+}
+wifi_power() { # on|off
+	n=0
+	for s in $(wifi_ap_list); do
+		n=$((n + 1))
+		if [ "$1" = off ]; then uci set "wireless.$s.disabled=1"; else uci -q delete "wireless.$s.disabled"; fi
+	done
+	[ "$n" -gt 0 ] || return 1
+	uci commit wireless
+	wifi reload >/dev/null 2>&1
+}
+wifi_bands() { # JSON array: one entry per band, "on" when any AP of that band is enabled
+	b24=0; b24on=0; b5=0; b5on=0; b6=0; b6on=0
+	for s in $(wifi_ap_list); do
+		d="$(uci -q get wireless.$s.device)"
+		bd="$(uci -q get wireless.$d.band)"
+		[ -n "$bd" ] || case "$(uci -q get wireless.$d.hwmode)" in *a*) bd=5g ;; *) bd=2g ;; esac
+		en=1; [ "$(uci -q get wireless.$s.disabled)" = 1 ] && en=0
+		[ "$(uci -q get wireless.$d.disabled)" = 1 ] && en=0
+		case "$bd" in
+			5g) b5=1; [ "$en" = 1 ] && b5on=1 ;;
+			6g) b6=1; [ "$en" = 1 ] && b6on=1 ;;
+			*) b24=1; [ "$en" = 1 ] && b24on=1 ;;
+		esac
+	done
+	o=""; sep=""
+	[ "$b24" = 1 ] && { o="$o$sep{\"band\":\"2.4\",\"on\":$([ "$b24on" = 1 ] && echo true || echo false)}"; sep=","; }
+	[ "$b5" = 1 ] && { o="$o$sep{\"band\":\"5\",\"on\":$([ "$b5on" = 1 ] && echo true || echo false)}"; sep=","; }
+	[ "$b6" = 1 ] && { o="$o$sep{\"band\":\"6\",\"on\":$([ "$b6on" = 1 ] && echo true || echo false)}"; sep=","; }
+	printf '[%s]' "$o"
+}
+cmd_router_sched_list() {
+	mkdir -p "$RUNDIR"
+	sched_migrate
+	set -- $(wifi_state)
+	printf '{"wifi":{"aps":%d,"off":%d,"bands":%s},"rules":[' "$1" "$2" "$(wifi_bands)"
+	first=1
+	[ -r "$SCHED_FILE" ] && while IFS='|' read -r id act days t1 t2 on; do
+		[ -n "$id" ] || continue
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '{"id":"%s","action":"%s","days":"%s","time":"%s","time2":"%s","on":%s}' "$id" "$act" "$days" "$t1" "$t2" "$([ "$on" = 1 ] && echo true || echo false)"
+	done < "$SCHED_FILE"
+	printf ']}\n'
+}
+# router-sched-save ID|new ACTION DAYS HH:MM [HH:MM] ENABLED(0|1)
+cmd_router_sched_save() {
+	id="$1"; act="$2"; days="$3"; t1="$4"; t2="$5"; on="$6"
+	case "$act" in reboot|wifi_off|wifi_on|wifi_window) ;; *) echo "invalid action" >&2; exit 1 ;; esac
+	sched_valid_days "$days" || { echo "invalid days" >&2; exit 1; }
+	sched_valid_time "$t1" || { echo "invalid time" >&2; exit 1; }
+	if [ "$act" = wifi_window ]; then
+		sched_valid_time "$t2" || { echo "invalid time" >&2; exit 1; }
+		[ "$t1" != "$t2" ] || { echo "start and end must differ" >&2; exit 1; }
+	else t2=""; fi
+	case "$on" in 0|1) ;; *) on=1 ;; esac
+	mkdir -p "$(dirname "$SCHED_FILE")" "$RUNDIR"; touch "$SCHED_FILE"
+	if [ "$id" = new ]; then
+		id=1
+		while grep -q "^$id|" "$SCHED_FILE"; do id=$((id + 1)); done
+		[ "$(grep -c . "$SCHED_FILE")" -lt 30 ] || { echo "too many schedules" >&2; exit 1; }
+	else
+		case "$id" in ''|*[!0-9]*) echo "invalid id" >&2; exit 1 ;; esac
+		grep -v "^$id|" "$SCHED_FILE" > "$RUNDIR/sch.tmp"; cp "$RUNDIR/sch.tmp" "$SCHED_FILE"; rm -f "$RUNDIR/sch.tmp"
+	fi
+	echo "$id|$act|$days|$t1|$t2|$on" >> "$SCHED_FILE"
+	sort -t'|' -k1,1n "$SCHED_FILE" > "$RUNDIR/sch.tmp"; cp "$RUNDIR/sch.tmp" "$SCHED_FILE"; rm -f "$RUNDIR/sch.tmp"
+	sched_apply
+	echo ok
+}
+cmd_router_sched_del() {
+	case "$1" in ''|*[!0-9]*) echo "invalid id" >&2; exit 1 ;; esac
+	[ -r "$SCHED_FILE" ] && { grep -v "^$1|" "$SCHED_FILE" > "$RUNDIR/sch.tmp"; cp "$RUNDIR/sch.tmp" "$SCHED_FILE"; rm -f "$RUNDIR/sch.tmp"; }
+	sched_apply
+	echo ok
+}
+cmd_router_sched_run() {
+	case "$1" in
+		reboot) /sbin/reboot ;;
+		wifi-off) wifi_power off ;;
+		wifi-on) wifi_power on ;;
+		*) echo "usage: router-sched-run reboot|wifi-off|wifi-on" >&2; exit 1 ;;
+	esac
+}
+cmd_router_wifi_power() {
+	case "$1" in on|off) wifi_power "$1" && echo ok || { echo "no access point found" >&2; exit 1; } ;; *) echo "usage: router-wifi-power on|off" >&2; exit 1 ;; esac
+}
+
+# router-lan-set IP PREFIX : change the LAN address (the page moves to the new address)
+cmd_router_lan() {
+	ip="$1"; pre="$2"
+	case "$ip" in ''|*[!0-9.]*) echo "invalid address" >&2; exit 1 ;; esac
+	echo "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || { echo "invalid address" >&2; exit 1; }
+	for o in $(echo "$ip" | tr . ' '); do [ "$o" -le 255 ] || { echo "invalid address" >&2; exit 1; }; done
+	case "$pre" in [0-9]|[0-9][0-9]) ;; *) echo "invalid prefix" >&2; exit 1 ;; esac
+	[ "$pre" -ge 8 ] && [ "$pre" -le 30 ] || { echo "invalid prefix" >&2; exit 1; }
+	oldip=$(uci -q get network.lan.ipaddr | cut -d/ -f1)
+	uci set network.lan.ipaddr="$ip/$pre"
+	uci -q delete network.lan.netmask
+	uci commit network
+	if uci -q get dhcp.odash_panel.name >/dev/null; then uci set dhcp.odash_panel.ip="$ip"; uci commit dhcp; fi
+	# keep fixed IPs inside the new subnet (same host part, new network part)
+	if [ -n "$oldip" ] && [ "$pre" -ge 24 ]; then
+		np=$(echo "$ip" | cut -d. -f1-3)
+		for h in $(uci -q show dhcp | sed -n "s/^dhcp\.\(@host\[[0-9]*\]\)\.ip=.*/\1/p"); do
+			hip=$(uci -q get dhcp."$h".ip)
+			case "$hip" in *.*.*.*) uci set dhcp."$h".ip="$np.${hip##*.}" ;; esac
+		done
+		# DHCP pool / dnsmasq keep working: pool is offset-based
+		uci commit dhcp
+	fi
+	( sleep 2; /etc/init.d/network restart; /etc/init.d/dnsmasq restart ) </dev/null >/dev/null 2>&1 &
+	echo ok
+}
+
+# router-dns-set IFACE auto | router-dns-set IFACE DNS1 [DNS2 ...]
+cmd_router_dns() {
+	i="$1"; shift
+	case "$i" in ''|*[!A-Za-z0-9_]*) echo "invalid interface" >&2; exit 1 ;; esac
+	uci -q get network."$i" >/dev/null || { echo "unknown interface" >&2; exit 1; }
+	uci -q delete network."$i".dns
+	if [ "$1" = auto ] || [ $# -eq 0 ]; then
+		uci -q delete network."$i".peerdns
+	else
+		for a in "$@"; do
+			case "$a" in *[!0-9A-Fa-f:.]*|'') echo "invalid DNS address" >&2; exit 1 ;; esac
+			uci add_list network."$i".dns="$a"
+		done
+		uci set network."$i".peerdns=0
+	fi
+	uci commit network
+	( sleep 1; ifup "$i" ) </dev/null >/dev/null 2>&1 &
+	echo ok
+}
+
+# panel-domain-get : JSON {domain, ip, host}
+cmd_panel_domain_get() {
+	d="$(uci -q get dhcp.odash_panel.name)"
+	ip="$(uci -q get network.lan.ipaddr | cut -d/ -f1)"
+	printf '{"domain":"%s","ip":"%s","host":"%s"}\n' "$(jesc "$d")" "$(jesc "$ip")" "$(jesc "$(uci -q get system.@system[0].hostname)")"
+}
+
+# panel-domain-set [DOMAIN] : makes DOMAIN resolve to this router for every device on the LAN
+cmd_panel_domain_set() {
+	d="$(echo "$1" | tr 'A-Z' 'a-z')"
+	if [ -z "$d" ]; then
+		uci -q delete dhcp.odash_panel
+		uci commit dhcp
+		/etc/init.d/dnsmasq reload >/dev/null 2>&1
+		echo ok; return
+	fi
+	echo "$d" | grep -qE '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$' || { echo "invalid domain" >&2; exit 1; }
+	[ "${#d}" -le 253 ] || { echo "invalid domain" >&2; exit 1; }
+	ip="$(uci -q get network.lan.ipaddr | cut -d/ -f1)"
+	[ -n "$ip" ] || { echo "no LAN address" >&2; exit 1; }
+	uci -q delete dhcp.odash_panel
+	uci set dhcp.odash_panel=domain
+	uci set dhcp.odash_panel.name="$d"
+	uci set dhcp.odash_panel.ip="$ip"
+	uci commit dhcp
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1
+	echo ok
+}
+
+# Wi-Fi uplinks (Travelmate)
+wifi_sta_dev() {
+	for d in $(ls /sys/class/net 2>/dev/null); do
+		case "$d" in lo|br-*|eth*|wan*|lan*) continue ;; esac
+		iwinfo "$d" info 2>/dev/null | grep -q 'Mode: Client' && { echo "$d"; return; }
+	done
+}
+cmd_router_wifi_info() {
+	inst=false; en=false
+	[ -x /etc/init.d/travelmate ] && inst=true
+	[ "$(uci -q get travelmate.global.trm_enabled)" = 1 ] && en=true
+	sta="$(wifi_sta_dev)"
+	ssid=""; sig=""; chan=""; bssid=""
+	if [ -n "$sta" ]; then
+		wi="$(iwinfo "$sta" info 2>/dev/null)"
+		ssid="$(echo "$wi" | sed -n 's/.*ESSID: "\(.*\)".*/\1/p' | head -n 1)"
+		sig="$(echo "$wi" | sed -n 's/.*Signal: \(-\{0,1\}[0-9]*\) dBm.*/\1/p' | head -n 1)"
+		chan="$(echo "$wi" | sed -n 's/.*Channel: \([0-9]*\).*/\1/p' | head -n 1)"
+		bssid="$(echo "$wi" | sed -n 's/.*Access Point: \([0-9A-Fa-f:]*\).*/\1/p' | head -n 1)"
+	fi
+	state=""
+	[ -r /tmp/trm_runtime.json ] && state="$(jsonfilter -i /tmp/trm_runtime.json -e '@.data.travelmate_status' 2>/dev/null)"
+	station=""
+	[ -r /tmp/trm_runtime.json ] && station="$(jsonfilter -i /tmp/trm_runtime.json -e '@.data.station_id' 2>/dev/null)"
+	gdev="$(ip route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+	printf '{"installed":%s,"enabled":%s,"state":"%s","device":"%s","ssid":"%s","signal":"%s","channel":"%s","bssid":"%s","station":"%s","default_dev":"%s","uplinks":[' \
+		"$inst" "$en" "$(jesc "$state")" "$(jesc "$sta")" "$(jesc "$ssid")" "$(jesc "$sig")" "$(jesc "$chan")" "$(jesc "$bssid")" "$(jesc "$station")" "$(jesc "$gdev")"
+	first=1
+	for id in $(uci -X -q show travelmate | sed -n 's/^travelmate\.\([A-Za-z0-9_]*\)=uplink$/\1/p'); do
+		[ "$first" = 1 ] || printf ','
+		first=0
+		us="$(uci -q get travelmate.$id.ssid)"
+		printf '{"id":"%s","ssid":"%s","device":"%s","enabled":%s,"connected":%s}' "$id" "$(jesc "$us")" \
+			"$(jesc "$(uci -q get travelmate.$id.device)")" "$([ "$(uci -q get travelmate.$id.enabled)" = 1 ] && echo true || echo false)" \
+			"$([ -n "$ssid" ] && [ "$ssid" = "$us" ] && echo true || echo false)"
+	done
+	printf ']}\n'
+}
+cmd_router_wifi_scan() {
+	sta="$(wifi_sta_dev)"
+	out=""
+	for d in $sta phy0 phy1 phy2; do
+		out="$(iwinfo "$d" scan 2>/dev/null)"
+		[ -n "$out" ] && break
+	done
+	printf '['
+	echo "$out" | awk '
+	function esc(x) { gsub(/\\/, "\\\\", x); gsub(/"/, "\\\"", x); return x }
+	function flush() { if (have && ssid != "") printf "%s{\"ssid\":\"%s\",\"bssid\":\"%s\",\"channel\":\"%s\",\"signal\":%s,\"enc\":\"%s\"}", (n++ ? "," : ""), esc(ssid), bssid, chan, (sig == "" ? "null" : sig), esc(enc) }
+	/^Cell / { flush(); have = 1; ssid = ""; bssid = $5; chan = ""; sig = ""; enc = ""; next }
+	/ESSID: / { v = $0; sub(/^.*ESSID: "/, "", v); sub(/"[^"]*$/, "", v); ssid = v; next }
+	/Channel: / { v = $0; sub(/^.*Channel: /, "", v); sub(/[^0-9].*$/, "", v); chan = v }
+	/Signal: / { v = $0; sub(/^.*Signal: /, "", v); sub(/ .*$/, "", v); sig = v }
+	/Encryption: / { v = $0; sub(/^.*Encryption: /, "", v); enc = v }
+	END { flush() }'
+	printf ']\n'
+}
+# router-wifi-set ID on|off|only
+cmd_router_wifi_set() {
+	id="$1"
+	case "$id" in ''|*[!A-Za-z0-9_]*) echo "invalid id" >&2; exit 1 ;; esac
+	[ "$(uci -q get travelmate.$id)" = uplink ] || { echo "unknown network" >&2; exit 1; }
+	case "$2" in
+		on) uci set travelmate.$id.enabled=1 ;;
+		off) uci set travelmate.$id.enabled=0 ;;
+		only)
+			for o in $(uci -X -q show travelmate | sed -n 's/^travelmate\.\([A-Za-z0-9_]*\)=uplink$/\1/p'); do
+				uci set travelmate.$o.enabled=0
+			done
+			uci set travelmate.$id.enabled=1 ;;
+		*) echo "usage: router-wifi-set ID on|off|only" >&2; exit 1 ;;
+	esac
+	uci commit travelmate
+	( /etc/init.d/travelmate restart ) </dev/null >/dev/null 2>&1 &
+	echo ok
+}
+
+
+# ---- access points (the router's own Wi-Fi networks) ----
+# router-ap-info : JSON list of AP networks with their radio settings
+cmd_router_ap_info() {
+	printf '{"radios":['
+	f=1
+	for r in $(uci -X -q show wireless | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-device$/\1/p'); do
+		[ "$f" = 1 ] || printf ','
+		f=0
+		band="$(uci -q get wireless.$r.band)"
+		if [ -z "$band" ]; then
+			case "$(uci -q get wireless.$r.hwmode)" in *a*) band=5g ;; *) band=2g ;; esac
+		fi
+		printf '{"id":"%s","band":"%s","channel":"%s","htmode":"%s","txpower":"%s","country":"%s","disabled":%s}' \
+			"$r" "$(jesc "$band")" "$(jesc "$(uci -q get wireless.$r.channel)")" "$(jesc "$(uci -q get wireless.$r.htmode)")" \
+			"$(jesc "$(uci -q get wireless.$r.txpower)")" "$(jesc "$(uci -q get wireless.$r.country)")" \
+			"$([ "$(uci -q get wireless.$r.disabled)" = 1 ] && echo true || echo false)"
+	done
+	printf '],"aps":['
+	f=1
+	for w in $(uci -X -q show wireless | sed -n 's/^wireless\.\([A-Za-z0-9_]*\)=wifi-iface$/\1/p'); do
+		[ "$(uci -q get wireless.$w.mode)" = ap ] || continue
+		[ "$f" = 1 ] || printf ','
+		f=0
+		printf '{"id":"%s","radio":"%s","ssid":"%s","encryption":"%s","hidden":%s,"disabled":%s,"isolate":%s,"has_key":%s,"network":"%s"}' \
+			"$(jesc "$w")" "$(jesc "$(uci -q get wireless.$w.device)")" "$(jesc "$(uci -q get wireless.$w.ssid)")" "$(jesc "$(uci -q get wireless.$w.encryption)")" \
+			"$([ "$(uci -q get wireless.$w.hidden)" = 1 ] && echo true || echo false)" "$([ "$(uci -q get wireless.$w.disabled)" = 1 ] && echo true || echo false)" \
+			"$([ "$(uci -q get wireless.$w.isolate)" = 1 ] && echo true || echo false)" "$([ -n "$(uci -q get wireless.$w.key)" ] && echo true || echo false)" \
+			"$(jesc "$(uci -q get wireless.$w.network)")"
+	done
+	printf ']}\n'
+}
+# router-ap-set ID key=value ...   (ID is a wifi-iface section or a radio; values are validated)
+cmd_router_ap_set() {
+	id="$1"; shift
+	case "$id" in ''|*[!A-Za-z0-9_]*) echo "invalid network" >&2; exit 1 ;; esac
+	typ="$(uci -q get wireless."$id")"
+	case "$typ" in wifi-iface|wifi-device) ;; *) echo "unknown network" >&2; exit 1 ;; esac
+	[ "$typ" = wifi-iface ] && [ "$(uci -q get wireless."$id".mode)" != ap ] && { echo "not an access point" >&2; exit 1; }
+	for kv in "$@"; do
+		k="${kv%%=*}"; v="${kv#*=}"
+		if [ "$typ" = wifi-iface ]; then
+			case "$k" in
+				ssid) [ "${#v}" -ge 1 ] && [ "${#v}" -le 32 ] || { echo "SSID must be 1-32 characters" >&2; exit 1; }
+					case "$v" in *[[:cntrl:]]*) echo "invalid SSID" >&2; exit 1 ;; esac ;;
+				key) [ "${#v}" -ge 8 ] && [ "${#v}" -le 63 ] || { echo "password must be 8-63 characters" >&2; exit 1; }
+					case "$v" in *[[:cntrl:]]*) echo "invalid password" >&2; exit 1 ;; esac ;;
+				encryption) case "$v" in psk2|psk2+ccmp|psk2+tkip+ccmp|psk-mixed|psk-mixed+ccmp|sae|sae+ccmp|sae-mixed|sae-mixed+ccmp|none) ;; *) echo "invalid encryption" >&2; exit 1 ;; esac ;;
+				hidden|disabled|isolate) case "$v" in 0|1) ;; *) echo "invalid value" >&2; exit 1 ;; esac ;;
+				*) echo "unknown setting: $k" >&2; exit 1 ;;
+			esac
+		else
+			case "$k" in
+				channel) case "$v" in auto) ;; ''|*[!0-9]*) echo "invalid channel" >&2; exit 1 ;; *) [ "$v" -le 233 ] || { echo "invalid channel" >&2; exit 1; } ;; esac ;;
+				htmode) case "$v" in HT20|HT40|VHT20|VHT40|VHT80|VHT160|HE20|HE40|HE80|HE160|EHT20|EHT40|EHT80|EHT160) ;; *) echo "invalid width" >&2; exit 1 ;; esac ;;
+				txpower) case "$v" in auto) ;; ''|*[!0-9]*) echo "invalid power" >&2; exit 1 ;; *) [ "$v" -le 40 ] || { echo "invalid power" >&2; exit 1; } ;; esac ;;
+				country) case "$v" in [A-Z][A-Z]) ;; *) echo "invalid country" >&2; exit 1 ;; esac ;;
+				disabled) case "$v" in 0|1) ;; *) echo "invalid value" >&2; exit 1 ;; esac ;;
+				*) echo "unknown setting: $k" >&2; exit 1 ;;
+			esac
+		fi
+	done
+	for kv in "$@"; do
+		k="${kv%%=*}"; v="${kv#*=}"
+		case "$k:$v" in
+			channel:auto|txpower:auto) uci -q delete wireless."$id"."$k" ;;
+			*) uci set wireless."$id"."$k=$v" ;;
+		esac
+		[ "$k" = key ] && [ "$(uci -q get wireless."$id".encryption)" = none ] && uci set wireless."$id".encryption=psk2
+	done
+	uci commit wireless
+	( sleep 2; wifi reload ) </dev/null >/dev/null 2>&1 &
+	echo ok
+}
+
+# ---- Samba (file sharing) ----
+SMBCFG=samba4
+smb_installed() { [ -x /usr/sbin/smbd ] && [ -f /etc/config/$SMBCFG ]; }
+smb_apply() { ( sleep 1; /etc/init.d/samba4 restart ) </dev/null >/dev/null 2>&1 & }
+smb_sections() { uci -q show $SMBCFG | sed -n 's/^'$SMBCFG'\.@sambashare\[\([0-9]*\)\]=sambashare$/\1/p'; }
+smb_yes() { case "$1" in 1|yes|true|on) echo true ;; *) echo false ;; esac; }
+smb_pwok() { case "$1" in '') return 1 ;; *[[:cntrl:]]*) return 1 ;; esac; [ "${#1}" -ge 4 ] && [ "${#1}" -le 127 ]; }
+smb_userok() { case "$1" in ''|[!a-z_]*|*[!a-z0-9_-]*|root) return 1 ;; esac; [ "${#1}" -le 32 ]; }
+# samba-info : JSON about the service, the shares, the users and the disks
+cmd_samba_info() {
+	if ! smb_installed; then printf '{"installed":false}\n'; return; fi
+	run=false; pgrep smbd >/dev/null 2>&1 && run=true
+	en=false; /etc/init.d/samba4 enabled 2>/dev/null && en=true
+	g() { uci -q get $SMBCFG.@samba[0].$1; }
+	printf '{"installed":true,"running":%s,"enabled":%s,"global":{"workgroup":"%s","description":"%s","macos":%s,"extra":%s},"shares":[' \
+		"$run" "$en" "$(jesc "$(g workgroup)")" "$(jesc "$(g description)")" "$(smb_yes "$(g macos)")" "$(smb_yes "$(g enable_extra_tuning)")"
+	f=1
+	for i in $(smb_sections); do
+		s="$SMBCFG.@sambashare[$i]"
+		p="$(uci -q get $s.path)"
+		[ "$f" = 1 ] || printf ','
+		f=0
+		set -- 0 0 0 /
+		[ -d "$p" ] && set -- $(df -P -k "$p" 2>/dev/null | awk 'NR==2{print $2,$3,$4,$6}')
+		um=false; ud=""
+		case "$p" in
+			/mnt/*|/media/*)
+				top="$(echo "$p" | cut -d/ -f1-3)"
+				if ! grep -q " $top " /proc/mounts; then
+					um=true
+					case "${top##*/}" in sd[a-z]|sd[a-z][0-9]*) [ -b "/dev/${top##*/}" ] && ud="/dev/${top##*/}" ;; esac
+				fi ;;
+		esac
+		printf '{"idx":%s,"name":"%s","path":"%s","read_only":%s,"guest_ok":%s,"browseable":%s,"force_root":%s,"users":"%s","create_mask":"%s","dir_mask":"%s","exists":%s,"mp":"%s","size":%s,"used":%s,"avail":%s,"unmounted":%s,"udev":"%s"}' \
+			"$i" "$(jesc "$(uci -q get $s.name)")" "$(jesc "$p")" "$(smb_yes "$(uci -q get $s.read_only)")" "$(smb_yes "$(uci -q get $s.guest_ok)")" \
+			"$( [ "$(uci -q get $s.browseable)" = no ] && echo false || echo true )" "$(smb_yes "$(uci -q get $s.force_root)")" \
+			"$(jesc "$(uci -q get $s.users)")" "$(jesc "$(uci -q get $s.create_mask)")" "$(jesc "$(uci -q get $s.dir_mask)")" \
+			"$( [ -d "$p" ] && echo true || echo false )" "$(jesc "$4")" "${1:-0}" "${2:-0}" "${3:-0}" "$um" "$(jesc "$ud")"
+	done
+	printf '],"users":['
+	f=1
+	pdbedit -L 2>/dev/null | while IFS=: read -r n rest; do
+		[ -n "$n" ] || continue
+		[ "$f" = 1 ] || printf ','
+		f=0
+		printf '"%s"' "$(jesc "$n")"
+	done
+	printf '],"sessions":['
+	f=1
+	devmap > /tmp/odash-smbdev.$$ 2>/dev/null
+	netstat -tn 2>/dev/null | awk '$4 ~ /:445$/ && $6=="ESTABLISHED"{sub(/:[0-9]+$/,"",$5); print $5}' | sort -u | while read -r ip; do
+		[ "$f" = 1 ] || printf ','
+		f=0
+		nm="$(awk -F "$TAB" -v ip="$ip" '$1=="D" && $5==ip { print $3; exit }' /tmp/odash-smbdev.$$)"
+		printf '{"ip":"%s","name":"%s"}' "$(jesc "$ip")" "$(jesc "$nm")"
+	done
+	rm -f /tmp/odash-smbdev.$$
+	printf '],"disks":['
+	f=1
+	df -P -k 2>/dev/null | awk 'NR>1 && ($6 ~ /^\/mnt\// || $6 ~ /^\/media\// || $1 ~ /^\/dev\/sd/) {print $1" "$2" "$3" "$4" "$6}' | while read -r dev sz us av mp; do
+		[ "$f" = 1 ] || printf ','
+		f=0
+		printf '{"dev":"%s","mp":"%s","size":%s,"used":%s,"avail":%s}' "$(jesc "$dev")" "$(jesc "$mp")" "$sz" "$us" "$av"
+	done
+	printf '],"ip":"%s"}\n' "$(jesc "$(uci -q get network.lan.ipaddr | cut -d/ -f1)")"
+}
+cmd_samba_svc() {
+	smb_installed || { echo "Samba is not installed" >&2; exit 1; }
+	case "$1" in
+		start|stop|restart|enable|disable) /etc/init.d/samba4 "$1" </dev/null >/dev/null 2>&1 ;;
+		*) echo "unknown action" >&2; exit 1 ;;
+	esac
+	echo ok
+}
+cmd_samba_global() {
+	smb_installed || { echo "Samba is not installed" >&2; exit 1; }
+	for kv in "$@"; do
+		k="${kv%%=*}"; v="${kv#*=}"
+		case "$k" in
+			workgroup) case "$v" in ''|*[!A-Za-z0-9_-]*) echo "invalid workgroup" >&2; exit 1 ;; esac; [ "${#v}" -le 15 ] || { echo "invalid workgroup" >&2; exit 1; } ;;
+			description) case "$v" in *[[:cntrl:]]*) echo "invalid description" >&2; exit 1 ;; esac; [ "${#v}" -le 64 ] || { echo "description too long" >&2; exit 1; } ;;
+			macos|enable_extra_tuning) case "$v" in 0|1) ;; *) echo "invalid value" >&2; exit 1 ;; esac ;;
+			*) echo "unknown setting: $k" >&2; exit 1 ;;
+		esac
+	done
+	for kv in "$@"; do uci set $SMBCFG.@samba[0]."${kv%%=*}=${kv#*=}"; done
+	uci commit $SMBCFG
+	smb_apply
+	echo ok
+}
+# samba-share-set IDX|new key=value ...
+cmd_samba_share_set() {
+	smb_installed || { echo "Samba is not installed" >&2; exit 1; }
+	id="$1"; shift
+	case "$id" in new) ;; ''|*[!0-9]*) echo "invalid share" >&2; exit 1 ;; *) uci -q get $SMBCFG.@sambashare[$id] >/dev/null || { echo "unknown share" >&2; exit 1; } ;; esac
+	for kv in "$@"; do
+		k="${kv%%=*}"; v="${kv#*=}"
+		case "$k" in
+			name) case "$v" in ''|*[!A-Za-z0-9\ ._-]*) echo "the share name may only contain letters, digits, space, dot, dash and underscore" >&2; exit 1 ;; esac
+				[ "${#v}" -le 60 ] || { echo "the share name is too long" >&2; exit 1; }
+				for j in $(smb_sections); do [ "$j" = "$id" ] && continue; [ "$(uci -q get $SMBCFG.@sambashare[$j].name)" = "$v" ] && { echo "another share already has this name" >&2; exit 1; }; done ;;
+			path) case "$v" in /*) ;; *) echo "the folder must be an absolute path" >&2; exit 1 ;; esac
+				case "$v" in *..*|*[[:cntrl:]]*|/|/proc*|/sys*|/dev*|/rom*|/etc*|/bin*|/sbin*|/lib*|/usr*) echo "this folder cannot be shared" >&2; exit 1 ;; esac ;;
+			read_only|guest_ok|browseable|force_root) case "$v" in 0|1) ;; *) echo "invalid value" >&2; exit 1 ;; esac ;;
+			users) case "$v" in *[!A-Za-z0-9_\ .-]*) echo "invalid user list" >&2; exit 1 ;; esac ;;
+			create_mask|dir_mask) case "$v" in [0-7][0-7][0-7][0-7]) ;; *) echo "the mask must be 4 octal digits" >&2; exit 1 ;; esac ;;
+			*) echo "unknown setting: $k" >&2; exit 1 ;;
+		esac
+	done
+	if [ "$id" = new ]; then
+		sec="$(uci add $SMBCFG sambashare)"
+		uci set $SMBCFG.$sec.read_only=no; uci set $SMBCFG.$sec.guest_ok=no; uci set $SMBCFG.$sec.create_mask=0666; uci set $SMBCFG.$sec.dir_mask=0777
+		ref="$SMBCFG.$sec"
+	else
+		ref="$SMBCFG.@sambashare[$id]"
+	fi
+	for kv in "$@"; do
+		k="${kv%%=*}"; v="${kv#*=}"
+		case "$k" in
+			read_only|guest_ok) [ "$v" = 1 ] && v=yes || v=no ;;
+			browseable) [ "$v" = 1 ] && v=yes || v=no ;;
+			path) mkdir -p "$v" 2>/dev/null ;;
+		esac
+		if [ "$k" = users ] && [ -z "$v" ]; then uci -q delete $ref.users; else uci set $ref."$k=$v"; fi
+	done
+	uci commit $SMBCFG
+	smb_apply
+	echo ok
+}
+cmd_samba_share_del() {
+	smb_installed || { echo "Samba is not installed" >&2; exit 1; }
+	case "$1" in ''|*[!0-9]*) echo "invalid share" >&2; exit 1 ;; esac
+	uci -q get $SMBCFG.@sambashare[$1] >/dev/null || { echo "unknown share" >&2; exit 1; }
+	uci delete $SMBCFG.@sambashare[$1]
+	uci commit $SMBCFG
+	smb_apply
+	echo ok
+}
+# samba-user-set NAME PASSWORD : creates the user when needed and sets the Samba password
+cmd_samba_user_set() {
+	smb_installed || { echo "Samba is not installed" >&2; exit 1; }
+	smb_userok "$1" || { echo "the user name must be lower-case letters, digits, dash or underscore" >&2; exit 1; }
+	smb_pwok "$2" || { echo "the password must be 4-127 characters" >&2; exit 1; }
+	if ! grep -q "^$1:" /etc/passwd; then
+		uid=1000
+		while grep -q "^[^:]*:[^:]*:$uid:" /etc/passwd; do uid=$((uid + 1)); done
+		grep -q "^$1:" /etc/group || echo "$1:x:$uid:" >> /etc/group
+		echo "$1:*:$uid:$uid:$1:/var:/bin/false" >> /etc/passwd
+	fi
+	printf '%s\n%s\n' "$2" "$2" | smbpasswd -a -s "$1" >/dev/null 2>&1 || { echo "could not set the password" >&2; exit 1; }
+	smbpasswd -e "$1" >/dev/null 2>&1
+	echo ok
+}
+cmd_samba_user_del() {
+	smb_installed || { echo "Samba is not installed" >&2; exit 1; }
+	smb_userok "$1" || { echo "invalid user" >&2; exit 1; }
+	smbpasswd -x "$1" >/dev/null 2>&1 || { echo "could not remove the user" >&2; exit 1; }
+	echo ok
+}
+
+# ---- Samba traffic (counted by /usr/libexec/odash/smbwatch, kept apart from the internet usage) ----
+cmd_samba_traffic() {
+	W="$STATE/smb"
+	run=false; pgrep -f "odash/smbwatch" >/dev/null 2>&1 && run=true
+	now="$(date +%s)"
+	d7="$(date -d "@$((now - 6 * 86400))" +%Y-%m-%d 2>/dev/null)"; d30="$(date -d "@$((now - 29 * 86400))" +%Y-%m-%d 2>/dev/null)"
+	{
+		echo "@@ dev"; devmap 2>/dev/null
+		echo "@@ cur"; cat "$W/cur" 2>/dev/null
+		echo "@@ agg"; tail -n 100 "$W/agg" 2>/dev/null
+		echo "@@ days"; if [ -s "$W/days" ]; then cat "$W/days"; else cat /etc/odash/smb-days.tsv 2>/dev/null; fi
+	} | awk -F "$TAB" -v run="$run" -v today="$(date +%Y-%m-%d)" -v d7="$d7" -v d30="$d30" '
+		function esc(s) { gsub(/\\/, "\\\\", s); gsub(/"/, "\\\"", s); return s }
+		function row(ip,    n) {
+			n = (ip in nm) ? nm[ip] : ""
+			return "{\"ip\":\"" esc(ip) "\",\"name\":\"" esc(n) "\""
+		}
+		/^@@ / { sec = substr($0, 4); next }
+		sec == "dev" && $1 == "D" { if ($5 != "") nm[$5] = $3; next }
+		sec == "cur" { split($0, f, " "); CU[f[1]] = f[4] " " f[5]; ips[f[1]] = 1; next }
+		sec == "agg" { split($0, f, " "); na++; A[na] = "[" f[1] "," f[2] "," f[3] "]"; next }
+		sec == "days" {
+			split($0, f, " "); if (f[1] == "" || f[2] == "") next
+			ips[f[2]] = 1
+			if (f[1] == today) { Tu[f[2]] += f[3]; Td[f[2]] += f[4] }
+			if (f[1] >= d7) { Wu[f[2]] += f[3]; Wd[f[2]] += f[4] }
+			if (f[1] >= d30) { Mu[f[2]] += f[3]; Md[f[2]] += f[4] }
+		}
+		END {
+			printf "{\"running\":%s,\"devices\":[", run
+			c = 0
+			for (ip in ips) {
+				split((ip in CU) ? CU[ip] : "0 0", r, " ")
+				printf "%s%s,\"rup\":%d,\"rdown\":%d,\"today\":[%d,%d],\"week\":[%d,%d],\"month\":[%d,%d]}", (c++ ? "," : ""), row(ip), r[1], r[2], Tu[ip], Td[ip], Wu[ip], Wd[ip], Mu[ip], Md[ip]
+			}
+			printf "],\"agg\":["
+			for (i = 1; i <= na; i++) printf "%s%s", (i > 1 ? "," : ""), A[i]
+			printf "]}\n"
+		}
+	'
+}
+
+# ---- disks: list, format, mount, safe remove (used by the Samba tab) ----
+DSK_JOB=/tmp/odash-disk.job
+DSK_LOG=/tmp/odash-disk.log
+dsk_base() { echo "${1#/dev/}" | sed 's/[0-9]*$//'; }
+dsk_devok() { case "$1" in /dev/sd[a-z]|/dev/sd[a-z][0-9]|/dev/sd[a-z][0-9][0-9]) [ -b "$1" ] ;; *) return 1 ;; esac; }
+dsk_fsok() { case "$1" in ext4|ntfs|exfat|vfat|f2fs) return 0 ;; *) return 1 ;; esac; }
+dsk_tool() { case "$1" in ext4) echo mkfs.ext4 ;; ntfs) echo mkfs.ntfs ;; exfat) echo mkfs.exfat ;; vfat) echo mkfs.fat ;; f2fs) echo mkfs.f2fs ;; esac; }
+dsk_have() { command -v "$(dsk_tool "$1")" >/dev/null 2>&1; }
+dsk_pkgs() { case "$1" in exfat) echo "exfat-mkfs exfat-fsck kmod-fs-exfat" ;; vfat) echo "dosfstools kmod-fs-vfat" ;; f2fs) echo "f2fs-tools kmod-fs-f2fs" ;; esac; }
+dsk_attr() { block info "$1" 2>/dev/null | sed -n 's/.*[ :]'"$2"'="\([^"]*\)".*/\1/p' | head -n1; }
+dsk_mounted() { grep -q "^$1 " /proc/mounts; }
+dsk_job() { printf '%s|%s\n' "$1" "$2" > "$DSK_JOB"; }
+dsk_running() { [ "$(cut -d'|' -f1 "$DSK_JOB" 2>/dev/null)" = running ]; }
+dsk_samba() { [ -x /etc/init.d/samba4 ] && /etc/init.d/samba4 "$1" </dev/null >/dev/null 2>&1; return 0; }
+dsk_fstab_del() {
+	for i in $(uci -q show fstab | sed -n "s/^fstab\.@mount\[\([0-9]*\)\]\.uuid='\(.*\)'$/\1 \2/p" | awk -v u="$1" 'toupper($2)==toupper(u){print $1}' | sort -rn); do
+		uci -q delete "fstab.@mount[$i]"
+	done
+	uci -q commit fstab
+}
+dsk_auto() {
+	for i in $(uci -q show fstab | sed -n "s/^fstab\.@mount\[\([0-9]*\)\]\.uuid='\(.*\)'$/\1 \2/p" | awk -v u="$1" 'toupper($2)==toupper(u){print $1}'); do
+		[ "$(uci -q get "fstab.@mount[$i].enabled")" = 1 ] && return 0
+	done
+	return 1
+}
+# install the tools for a filesystem when they are missing
+dsk_prep() {
+	dsk_have "$1" && return 0
+	p=$(dsk_pkgs "$1")
+	[ -n "$p" ] || return 1
+	apk update >/dev/null 2>&1
+	apk add $p || return 1
+	kmodloader >/dev/null 2>&1
+	dsk_have "$1"
+}
+# unmount one device (all of its mount points)
+dsk_umount() {
+	for mp in $(awk -v d="$1" '$1==d{print $2}' /proc/mounts); do
+		umount "$mp" 2>/dev/null || return 1
+	done
+	return 0
+}
+# mount a device and keep it mounted after a reboot
+dsk_mount_dev() {
+	dev="$1"
+	dsk_mounted "$dev" && return 0
+	u=$(dsk_attr "$dev" UUID)
+	t=$(dsk_attr "$dev" TYPE)
+	[ -n "$t" ] || { echo "the disk has no filesystem" >&2; return 1; }
+	case "$t" in
+		ntfs) mt=ntfs3; opt=noatime ;;
+		ext4) mt=ext4; opt=noatime,commit=5 ;;
+		vfat) mt=vfat; opt=noatime ;;
+		exfat) mt=exfat; opt=noatime ;;
+		f2fs) mt=f2fs; opt=noatime ;;
+		*) echo "unsupported filesystem: $t" >&2; return 1 ;;
+	esac
+	grep -qw "$mt" /proc/filesystems || kmodloader >/dev/null 2>&1
+	mp="/mnt/${dev##*/}"
+	mkdir -p "$mp"
+	if ! mount -t "$mt" -o "$opt" "$dev" "$mp" 2>/tmp/odash-mnt.err; then
+		# a disk left dirty by a power cut: repair it, then try once more
+		case "$t" in
+			ext4) e2fsck -p -f "$dev" >/dev/null 2>&1 ;;
+			ntfs) ntfsfix -d "$dev" >/dev/null 2>&1 ;;
+			vfat) command -v fsck.fat >/dev/null 2>&1 && fsck.fat -a "$dev" >/dev/null 2>&1 ;;
+			exfat) command -v fsck.exfat >/dev/null 2>&1 && fsck.exfat -p "$dev" >/dev/null 2>&1 ;;
+		esac
+		mount -t "$mt" -o "$opt" "$dev" "$mp" 2>/tmp/odash-mnt.err || { cat /tmp/odash-mnt.err >&2; return 1; }
+	fi
+	if [ -n "$u" ]; then
+		dsk_fstab_del "$u"
+		s=$(uci add fstab mount)
+		uci set "fstab.$s.target=$mp"
+		uci set "fstab.$s.uuid=$u"
+		uci set "fstab.$s.enabled=1"
+		uci set "fstab.$s.fstype=$mt"
+		uci set "fstab.$s.options=$opt"
+		uci commit fstab
+	fi
+	return 0
+}
+
+cmd_disk_list() {
+	df -P -k > /tmp/odash-df.$$ 2>/dev/null
+	printf '{"disks":['
+	f=1
+	for sd in /sys/block/sd[a-z]; do
+		[ -d "$sd" ] || continue
+		b="${sd##*/}"
+		sz=$(cat "$sd/size" 2>/dev/null); sz=${sz:-0}
+		md=$(cat "$sd/device/vendor" "$sd/device/model" 2>/dev/null | tr '\n' ' ' | sed 's/  */ /g; s/ *$//')
+		[ "$f" = 1 ] || printf ','
+		f=0
+		printf '{"dev":"/dev/%s","size":%s,"model":"%s","parts":[' "$b" "$((sz / 2))" "$(jesc "$md")"
+		pl=$(ls -d "$sd/$b"[0-9]* 2>/dev/null | sed 's#.*/##')
+		[ -n "$pl" ] || pl="$b"
+		g=1
+		for p in $pl; do
+			dev="/dev/$p"
+			if [ "$p" = "$b" ]; then psz=$sz; else psz=$(cat "$sd/$p/size" 2>/dev/null); fi
+			psz=$((${psz:-0} / 2))
+			ft=$(dsk_attr "$dev" TYPE); lb=$(dsk_attr "$dev" LABEL); uu=$(dsk_attr "$dev" UUID)
+			set -- $(awk -v d="$dev" '$1==d{print $2, $3; exit}' /proc/mounts)
+			mp="$1"; mt="$2"
+			us=0; av=0
+			if [ -n "$mp" ]; then set -- $(awk -v m="$mp" '$6==m{print $3, $4; exit}' /tmp/odash-df.$$); us=${1:-0}; av=${2:-0}; fi
+			au=false
+			[ -n "$uu" ] && dsk_auto "$uu" && au=true
+			[ "$g" = 1 ] || printf ','
+			g=0
+			printf '{"dev":"%s","size":%s,"fs":"%s","label":"%s","mp":"%s","mtype":"%s","used":%s,"avail":%s,"auto":%s}' \
+				"$dev" "$psz" "$(jesc "$ft")" "$(jesc "$lb")" "$(jesc "$mp")" "$(jesc "$mt")" "$us" "$av" "$au"
+		done
+		printf ']}'
+	done
+	rm -f /tmp/odash-df.$$
+	printf '],"fs":{'
+	f=1
+	for x in ext4 ntfs exfat vfat f2fs; do
+		[ "$f" = 1 ] || printf ','
+		f=0
+		if dsk_have "$x"; then printf '"%s":true' "$x"; else printf '"%s":false' "$x"; fi
+	done
+	js=$(cat "$DSK_JOB" 2>/dev/null)
+	printf '},"job":{"state":"%s","msg":"%s"}}\n' "$(jesc "${js%%|*}")" "$(jesc "${js#*|}")"
+}
+
+dsk_format_run() {
+	dev="$1"; fs="$2"; lbl="$3"; whole="$4"
+	base=$(dsk_base "$dev")
+	dsk_job running "Preparing the tools"
+	dsk_prep "$fs" || { dsk_job error "The tools for $fs could not be installed (is the router online?)"; return 1; }
+	if [ "$whole" = 1 ] && ! command -v sfdisk >/dev/null 2>&1; then
+		apk add sfdisk >/dev/null 2>&1 || { dsk_job error "sfdisk could not be installed (is the router online?)"; return 1; }
+	fi
+	dsk_job running "Unmounting"
+	dsk_samba stop
+	sync
+	if [ "$whole" = 1 ]; then tg="$(ls /dev/$base[0-9]* 2>/dev/null) /dev/$base"; else tg="$dev"; fi
+	for d in $tg; do
+		u=$(dsk_attr "$d" UUID)
+		dsk_umount "$d" || { dsk_job error "$d is busy and could not be unmounted"; dsk_samba start; return 1; }
+		[ -z "$u" ] || dsk_fstab_del "$u"
+	done
+	t="$dev"
+	if [ "$whole" = 1 ]; then
+		dsk_job running "Creating the partition table"
+		command -v wipefs >/dev/null 2>&1 && wipefs -a "/dev/$base" >/dev/null 2>&1
+		case "$fs" in ext4|f2fs) gt=0FC63DAF-8483-4772-8E79-3D69D8477DE4 ;; *) gt=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7 ;; esac
+		printf 'label: gpt\ntype=%s\n' "$gt" | sfdisk --wipe always --wipe-partitions always "/dev/$base" || { dsk_job error "Could not create the partition"; dsk_samba start; return 1; }
+		t="/dev/${base}1"
+		n=0
+		while [ "$n" -lt 15 ] && [ ! -b "$t" ]; do sleep 1; n=$((n + 1)); done
+		[ -b "$t" ] || { dsk_job error "The new partition did not appear"; dsk_samba start; return 1; }
+		sleep 2
+	fi
+	dsk_job running "Formatting as $fs (this can take a few minutes)"
+	case "$fs" in
+		ext4) mkfs.ext4 -F -q -L "$lbl" "$t" ;;
+		ntfs) mkfs.ntfs -Q -L "$lbl" "$t" ;;
+		exfat) mkfs.exfat -L "$lbl" "$t" ;;
+		vfat) mkfs.fat -F 32 -n "$(echo "$lbl" | cut -c1-11 | tr 'a-z' 'A-Z')" "$t" ;;
+		f2fs) mkfs.f2fs -f -l "$lbl" "$t" ;;
+	esac || { dsk_job error "Formatting failed"; dsk_samba start; return 1; }
+	sync
+	sleep 1
+	dsk_job running "Mounting"
+	dsk_mount_dev "$t" || { dsk_job error "Formatted, but mounting failed: $(tr '\n' ' ' < /tmp/odash-mnt.err 2>/dev/null)"; dsk_samba start; return 1; }
+	dsk_samba start
+	dsk_job done "$t is formatted as $fs and mounted at /mnt/${t##*/}"
+}
+# odash disk-format DEV FS LABEL part|whole CONFIRM   (CONFIRM = device name, e.g. sda2)
+cmd_disk_format() {
+	dev="$1"; fs="$2"; lbl="$3"; mode="$4"; cf="$5"
+	dsk_devok "$dev" || { echo "invalid device" >&2; exit 1; }
+	dsk_fsok "$fs" || { echo "unsupported filesystem" >&2; exit 1; }
+	[ "$cf" = "${dev##*/}" ] || { echo "the confirmation does not match the device" >&2; exit 1; }
+	case "$mode" in whole) w=1; [ "$dev" = "/dev/$(dsk_base "$dev")" ] || { echo "whole-disk mode needs the disk itself" >&2; exit 1; } ;; part) w=0 ;; *) echo "invalid mode" >&2; exit 1 ;; esac
+	[ -n "$lbl" ] || lbl=data
+	case "$lbl" in *[!A-Za-z0-9_\ -]*) echo "invalid label (letters, digits, space, - and _)" >&2; exit 1 ;; esac
+	[ "${#lbl}" -le 16 ] || { echo "the label is too long (16 characters at most)" >&2; exit 1; }
+	dsk_running && { echo "another disk job is running" >&2; exit 1; }
+	dsk_job running "Starting"
+	( dsk_format_run "$dev" "$fs" "$lbl" "$w" ) </dev/null >"$DSK_LOG" 2>&1 &
+	echo started
+}
+cmd_disk_mount() {
+	dsk_devok "$1" || { echo "invalid device" >&2; exit 1; }
+	dsk_running && { echo "a disk job is running" >&2; exit 1; }
+	dsk_mount_dev "$1" || exit 1
+	echo ok
+}
+# odash disk-eject DEV [detach] : unmount a partition, or (with a disk and "detach") unmount everything on it
+cmd_disk_eject() {
+	dsk_devok "$1" || { echo "invalid device" >&2; exit 1; }
+	dsk_running && { echo "a disk job is running" >&2; exit 1; }
+	base=$(dsk_base "$1")
+	if [ "$2" = detach ]; then tg="$(ls /dev/$base[0-9]* 2>/dev/null) /dev/$base"; else tg="$1"; fi
+	dsk_samba stop
+	sync
+	for d in $tg; do
+		dsk_umount "$d" || { dsk_samba start; echo "$d is busy and could not be unmounted" >&2; exit 1; }
+	done
+	sync
+	[ "$2" = detach ] && echo 1 > "/sys/block/$base/device/delete" 2>/dev/null
+	dsk_samba start
+	echo ok
+}
+
+# ---- export / import of the package data (for a router reset and reinstall) ----
+# data-export : base64 of a .tar.gz with settings, device names, schedules, history and fixed IPs
+cmd_data_export() {
+	w="$(mktemp -d /tmp/odash-exp.XXXXXX)" || exit 1
+	mkdir -p "$w/etc/odash" "$w/etc/config"
+	cp -a /etc/odash/. "$w/etc/odash/" 2>/dev/null
+	cp /etc/config/odash "$w/etc/config/odash" 2>/dev/null
+	# the live statistics live in RAM; take the newest copy
+	[ -s "$STATS" ] && cp "$STATS" "$w/etc/odash/stats.tsv"
+	# fixed IPs and host names (OpenWrt static leases)
+	for h in $(uci -X -q show dhcp | sed -n 's/^dhcp\.\([A-Za-z0-9_]*\)=host$/\1/p'); do
+		printf '%s\t%s\t%s\n' "$(uci -q get dhcp.$h.mac)" "$(uci -q get dhcp.$h.name)" "$(uci -q get dhcp.$h.ip)"
+	done > "$w/leases.tsv"
+	echo "odash-export 1" > "$w/MANIFEST"
+	( cd "$w" && tar czf - MANIFEST leases.tsv etc ) | base64 | tr -d '\n'
+	echo
+	rm -rf "$w"
+}
+IMPORT_B64=/tmp/odash-import.b64
+# data-import-chunk N BASE64 : receive the file in pieces (N=0 starts over)
+cmd_data_import_chunk() {
+	[ "$1" = 0 ] && : > "$IMPORT_B64"
+	case "$2" in *[!A-Za-z0-9+/=]*|'') echo "invalid data" >&2; exit 1 ;; esac
+	printf '%s' "$2" >> "$IMPORT_B64"
+	echo ok
+}
+cmd_data_import_apply() {
+	[ -s "$IMPORT_B64" ] || { echo "nothing was uploaded" >&2; exit 1; }
+	w="$(mktemp -d /tmp/odash-imp.XXXXXX)" || exit 1
+	base64 -d < "$IMPORT_B64" > "$w/a.tgz" 2>/dev/null || { rm -rf "$w" "$IMPORT_B64"; echo "the file is not a valid backup" >&2; exit 1; }
+	rm -f "$IMPORT_B64"
+	mkdir "$w/x"
+	tar tzf "$w/a.tgz" 2>/dev/null > "$w/list" || { rm -rf "$w"; echo "the file is not a valid backup" >&2; exit 1; }
+	grep -q '^MANIFEST$' "$w/list" || { rm -rf "$w"; echo "this is not an oDash backup" >&2; exit 1; }
+	# only paths we wrote ourselves: no absolute paths, no '..'
+	if grep -qE '(^/|\.\.)' "$w/list" || grep -qvE '^(MANIFEST|leases\.tsv|etc|etc/|etc/odash/?|etc/odash/[A-Za-z0-9._-]+|etc/config/?|etc/config/odash)$' "$w/list"; then
+		rm -rf "$w"; echo "the backup contains unexpected files" >&2; exit 1
+	fi
+	tar xzf "$w/a.tgz" -C "$w/x" 2>/dev/null || { rm -rf "$w"; echo "could not unpack the backup" >&2; exit 1; }
+	/etc/init.d/odash stop >/dev/null 2>&1
+	mkdir -p /etc/odash
+	[ -d "$w/x/etc/odash" ] && cp -a "$w/x/etc/odash/." /etc/odash/
+	[ -f "$w/x/etc/config/odash" ] && cp "$w/x/etc/config/odash" /etc/config/odash
+	if [ -s "$w/x/leases.tsv" ]; then
+		while IFS="$TAB" read -r m n i; do
+			[ -n "$m" ] || continue
+			valid_mac "$(echo "$m" | tr 'A-F' 'a-f')" || continue
+			hs="$(uci_find dhcp host "$(echo "$m" | tr 'A-F' 'a-f')")"
+			[ -n "$hs" ] || { hs="$(uci add dhcp host)" && uci set "dhcp.$hs.mac=$m"; }
+			[ -n "$n" ] && uci set "dhcp.$hs.name=$n"
+			[ -n "$i" ] && uci set "dhcp.$hs.ip=$i"
+		done < "$w/x/leases.tsv"
+		uci commit dhcp
+	fi
+	rm -rf "$w"
+	sched_apply 2>/dev/null
+	bk_apply 2>/dev/null
+	ss_apply 2>/dev/null
+	dsch_apply 2>/dev/null
+	/etc/init.d/odash start >/dev/null 2>&1
+	( sleep 2; /etc/init.d/dnsmasq restart ) </dev/null >/dev/null 2>&1 &
+	echo ok
+}
+
+# ---- scheduled backup of the oDash data to a disk folder (settings in /etc/odash/backup.conf) ----
+BK_CONF=/etc/odash/backup.conf
+BK_TAG="# odash-backup"
+BK_INT=/etc/odash/backups
+bk_load() { BK_ON=0; BK_DIR="$BK_INT"; BK_KEEP=3; BK_DOW='0'; BK_TIME=04:30; [ -r "$BK_CONF" ] && . "$BK_CONF"; }
+bk_dirok() { [ "$1" = "$BK_INT" ] && return 0; case "$1" in /*) ;; *) return 1 ;; esac; case "$1" in *[!A-Za-z0-9_./-]*|*..*|/|/proc*|/sys*|/dev*|/rom*|/etc*|/bin*|/sbin*|/lib*|/usr*|/tmp*|/overlay*) return 1 ;; esac; return 0; }
+# the folder must be on a mounted disk, so a missing disk never fills the router's own flash
+bk_mounted() { case "$1" in /mnt/*|/media/*) grep -q " $(echo "$1" | cut -d/ -f1-3) " /proc/mounts ;; *) return 0 ;; esac; }
+bk_apply() {
+	mkdir -p "$RUNDIR"; touch "$CRON_FILE"
+	tmp="$RUNDIR/cron.bk.$$"
+	grep -vF "$BK_TAG" "$CRON_FILE" > "$tmp"
+	bk_load
+	if [ "$BK_ON" = 1 ] && [ -n "$BK_DIR" ]; then
+		h="${BK_TIME%%:*}"; m="${BK_TIME##*:}"; h="${h#0}"; m="${m#0}"
+		echo "${m:-0} ${h:-0} * * $BK_DOW /usr/bin/odash backup-run $BK_TAG" >> "$tmp"
+	fi
+	cp "$tmp" "$CRON_FILE"; rm -f "$tmp"
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+cmd_backup_get() {
+	bk_load
+	mt=false; [ -n "$BK_DIR" ] && bk_mounted "$BK_DIR" && mt=true
+	printf '{"enabled":%s,"dir":"%s","keep":%s,"dow":"%s","time":"%s","mounted":%s,"files":[' \
+		"$([ "$BK_ON" = 1 ] && echo true || echo false)" "$(jesc "$BK_DIR")" "$BK_KEEP" "$(jesc "$BK_DOW")" "$(jesc "$BK_TIME")" "$mt"
+	f=1; tot=0
+	if [ -n "$BK_DIR" ] && [ -d "$BK_DIR" ] && $mt; then
+		for x in $(ls -1t "$BK_DIR"/odash-backup-*.tar.gz 2>/dev/null | head -n 20); do
+			[ "$f" = 1 ] || printf ','
+			f=0
+			sz="$(wc -c < "$x")"; tot=$((tot + sz))
+			printf '{"name":"%s","size":%s}' "$(jesc "${x##*/}")" "$sz"
+		done
+	fi
+	fr="$(df -k "${BK_DIR:-/etc}" 2>/dev/null | awk 'NR==2{print $4*1024}')"; [ -d "$BK_DIR" ] || fr="$(df -k /etc 2>/dev/null | awk 'NR==2{print $4*1024}')"
+	printf '],"total":%s,"free":%s,"internal":%s}\n' "$tot" "${fr:-0}" "$([ "$BK_DIR" = "$BK_INT" ] && echo true || echo false)"
+}
+# odash backup-set ON DIR KEEP DOW TIME
+cmd_backup_set() {
+	on="$1"; dir="$2"; keep="$3"; dow="$4"; tm="$5"
+	case "$on" in 0|1) ;; *) echo "invalid value" >&2; exit 1 ;; esac
+	if [ "$on" = 1 ]; then
+		bk_dirok "$dir" || { echo "invalid folder" >&2; exit 1; }
+		bk_mounted "$dir" || { echo "the disk for this folder is not mounted" >&2; exit 1; }
+	fi
+	case "$keep" in ''|*[!0-9]*) echo "invalid number of copies" >&2; exit 1 ;; esac
+	[ "$keep" -ge 1 ] && [ "$keep" -le 50 ] || { echo "keep 1 to 50 copies" >&2; exit 1; }
+	sched_valid_days "$dow" || { echo "invalid day" >&2; exit 1; }
+	sched_valid_time "$tm" || { echo "invalid time" >&2; exit 1; }
+	mkdir -p /etc/odash
+	printf 'BK_ON=%s\nBK_DIR="%s"\nBK_KEEP=%s\nBK_DOW="%s"\nBK_TIME=%s\nBK_MIG=1\n' "$on" "$dir" "$keep" "$dow" "$tm" > "$BK_CONF"
+	bk_apply
+	echo ok
+}
+cmd_backup_run() {
+	bk_load
+	bk_dirok "$BK_DIR" || { echo "no valid backup folder is set" >&2; exit 1; }
+	bk_mounted "$BK_DIR" || { echo "the disk for the backup folder is not mounted" >&2; exit 1; }
+	mkdir -p "$BK_DIR" || { echo "could not create the folder" >&2; exit 1; }
+	if [ "$BK_DIR" = "$BK_INT" ]; then # the router's own flash: keep a free reserve
+		fr="$(df -k "$BK_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+		[ "${fr:-0}" -ge 2048 ] || { echo "not enough free space on the router" >&2; exit 1; }
+	fi
+	out="$BK_DIR/odash-backup-$(date +%Y%m%d-%H%M).tar.gz"
+	cmd_data_export | base64 -d > "$out.part" 2>/dev/null && [ -s "$out.part" ] && mv "$out.part" "$out" || { rm -f "$out.part"; echo "the backup could not be written" >&2; exit 1; }
+	sync
+	ls -1t "$BK_DIR"/odash-backup-*.tar.gz 2>/dev/null | tail -n +$((BK_KEEP + 1)) | while read -r old; do rm -f "$old"; done
+	echo ok
+}
+cmd_backup_delete() {
+	bk_load
+	case "$1" in odash-backup-[0-9]*.tar.gz) ;; *) echo "invalid file" >&2; exit 1 ;; esac
+	case "$1" in */*|*[!A-Za-z0-9._-]*) echo "invalid file" >&2; exit 1 ;; esac
+	bk_dirok "$BK_DIR" || { echo "no valid backup folder is set" >&2; exit 1; }
+	[ -f "$BK_DIR/$1" ] || { echo "the file was not found" >&2; exit 1; }
+	rm -f "$BK_DIR/$1" && sync
+	echo ok
+}
+cmd_backup_restore() {
+	bk_load
+	case "$1" in odash-backup-[0-9]*.tar.gz) ;; *) echo "invalid file" >&2; exit 1 ;; esac
+	case "$1" in */*) echo "invalid file" >&2; exit 1 ;; esac
+	[ -f "$BK_DIR/$1" ] || { echo "the file was not found" >&2; exit 1; }
+	base64 < "$BK_DIR/$1" | tr -d '\n' > "$IMPORT_B64"
+	cmd_data_import_apply
+}
+
+# ---- update from the panel: the page uploads the release .tar.gz, this unpacks and installs it ----
+PKG_B64=/tmp/odash-upd.b64
+cmd_pkg_version() { echo "$ODASH_VERSION"; }
+cmd_pkg_chunk() {
+	[ "$1" = 0 ] && : > "$PKG_B64"
+	case "$2" in *[!A-Za-z0-9+/=]*|'') echo "invalid data" >&2; exit 1 ;; esac
+	printf '%s' "$2" >> "$PKG_B64"
+	echo ok
+}
+cmd_pkg_apply() {
+	[ -s "$PKG_B64" ] || { echo "nothing was uploaded" >&2; exit 1; }
+	w="$(mktemp -d /tmp/odash-upd.XXXXXX)" || exit 1
+	base64 -d < "$PKG_B64" > "$w/p.tgz" 2>/dev/null || { rm -rf "$w" "$PKG_B64"; echo "the file is not a valid package" >&2; exit 1; }
+	rm -f "$PKG_B64"
+	tar tzf "$w/p.tgz" 2>/dev/null > "$w/list" || { rm -rf "$w"; echo "the file is not a valid package" >&2; exit 1; }
+	if grep -qE '(^/|\.\.)' "$w/list" || grep -qvE '^[oO][dD]ash-[0-9][0-9.]*(/|$)' "$w/list" || ! grep -qE '^[oO][dD]ash-[0-9][0-9.]*/install\.sh$' "$w/list"; then
+		rm -rf "$w"; echo "this is not an oDash package (use oDash-VERSION.tar.gz)" >&2; exit 1
+	fi
+	mkdir "$w/x"
+	tar xzf "$w/p.tgz" -C "$w/x" 2>/dev/null || { rm -rf "$w"; echo "could not unpack the package" >&2; exit 1; }
+	d="$(ls -d "$w"/x/[oO][dD]ash-[0-9]* | head -n 1)"
+	[ -f "$d/install.sh" ] || { rm -rf "$w"; echo "the package has no installer" >&2; exit 1; }
+	: > /tmp/odash-update.log
+	# a separate process: the installer replaces this very script
+	sh -c "sleep 1; sh '$d/install.sh' >> /tmp/odash-update.log 2>&1; echo FINISHED >> /tmp/odash-update.log; rm -rf '$w'" </dev/null >/dev/null 2>&1 &
+	echo started
+}
+
+# ---- scheduled speed tests (settings in /etc/odash/speedsched.conf, cron lines tagged "# odash-speed") ----
+SS_CONF=/etc/odash/speedsched.conf
+SS_TAG="# odash-speed"
+ss_load() { SS_ON=0; SS_MODE=both; SS_EVERY=360; [ -r "$SS_CONF" ] && . "$SS_CONF"; }
+ss_apply() {
+	mkdir -p "$RUNDIR"; touch "$CRON_FILE"
+	tmp="$RUNDIR/cron.ss.$$"
+	grep -vF "$SS_TAG" "$CRON_FILE" > "$tmp"
+	ss_load
+	if [ "$SS_ON" = 1 ]; then
+		case "$SS_EVERY" in
+			30) c="7,37 * * * *" ;;
+			60) c="7 * * * *" ;;
+			1440) c="7 3 * * *" ;;
+			*) c="7 */$((SS_EVERY / 60)) * * *" ;;
+		esac
+		echo "$c /usr/bin/odash speed-sched-run $SS_TAG" >> "$tmp"
+	fi
+	cp "$tmp" "$CRON_FILE"; rm -f "$tmp"
+	/etc/init.d/cron enable >/dev/null 2>&1
+	/etc/init.d/cron restart >/dev/null 2>&1
+}
+cmd_speed_sched_get() {
+	ss_load
+	printf '{"enabled":%s,"mode":"%s","every":%s}\n' "$([ "$SS_ON" = 1 ] && echo true || echo false)" "$SS_MODE" "$SS_EVERY"
+}
+# odash speed-sched-set ON MODE EVERY_MINUTES
+cmd_speed_sched_set() {
+	case "$1" in 0|1) ;; *) echo "invalid value" >&2; exit 1 ;; esac
+	case "$2" in direct|proxy|both) ;; *) echo "invalid route" >&2; exit 1 ;; esac
+	case "$3" in 30|60|120|180|360|720|1440) ;; *) echo "invalid interval" >&2; exit 1 ;; esac
+	mkdir -p /etc/odash
+	printf 'SS_ON=%s\nSS_MODE=%s\nSS_EVERY=%s\n' "$1" "$2" "$3" > "$SS_CONF"
+	ss_apply
+	echo ok
+}
+# called by cron: one test per chosen route, saved in the same history as manual tests (marked "auto")
+cmd_speed_sched_run() {
+	ss_load
+	mkdir -p "$RUNDIR"
+	if [ -r "$RUNDIR/speed.json" ] && grep -q '"state":"running"' "$RUNDIR/speed.json"; then exit 0; fi
+	case "$SS_MODE" in both) ml="direct proxy" ;; *) ml="$SS_MODE" ;; esac
+	for m in $ml; do
+		SPEED_MODE="$m"; SPEED_AUTO=1
+		rm -f "$RUNDIR/speed.live"
+		speed_run >/dev/null 2>&1
+		sleep 3
+	done
+}
+
+# ---- LED management (RGB status LED, see /usr/libexec/odash/led) ----
+LEDLIB="${LED_LIB:-/usr/libexec/odash}"
+cmd_led_get() {
+	. "$LEDLIB/led-defaults"; led_load
+	rgb=false
+	ls /sys/class/leds 2>/dev/null | grep -qi red && ls /sys/class/leds | grep -qi green && ls /sys/class/leds | grep -qi blue && rgb=true
+	mono=false; mw=""; mb=""
+	if [ "$rgb" = false ]; then
+		mw="$(ls /sys/class/leds 2>/dev/null | grep -i '^white' | head -n 1)"; mb="$(ls /sys/class/leds 2>/dev/null | grep -i '^blue' | head -n 1)"
+		{ [ -n "$mw" ] || [ -n "$mb" ]; } && mono=true
+	fi
+	run=false
+	[ -f "$RUNDIR/led.pid" ] && kill -0 "$(cat "$RUNDIR/led.pid")" 2>/dev/null && run=true
+	printf '{"rgb":%s,"mono":%s,"white":"%s","blue":"%s","running":%s,"cfg":{' "$rgb" "$mono" "$(jesc "$mw")" "$(jesc "$mb")" "$run"
+	first=1
+	for k in $LED_KEYS; do
+		eval "v=\$L_$k"
+		[ "$first" = 1 ] || printf ','
+		first=0
+		printf '"%s":"%s"' "$k" "$(jesc "$v")"
+	done
+	printf '},"state":'
+	if [ -r "$RUNDIR/led.state" ]; then
+		awk -F= 'BEGIN { printf "{" } NF >= 2 { printf "%s\"%s\":\"%s\"", (n++ ? "," : ""), $1, $2 } END { printf "}" }' "$RUNDIR/led.state"
+	else
+		printf 'null'
+	fi
+	printf '}\n'
+}
+led_valid() { # key value
+	case "$1" in
+		enabled|night|newdev|flicker) case "$2" in 0|1) return 0 ;; esac ;;
+		c_*|idle_color) case "$2" in [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) return 0 ;; esac ;;
+		e_*) case "$2" in solid|blink|slowblink|breathe) return 0 ;; esac ;;
+		brightness|night_level|cpu_pct) case "$2" in ''|*[!0-9]*) ;; *) [ "$2" -le 100 ] && return 0 ;; esac ;;
+		slow_ms|flicker_kbps) case "$2" in ''|*[!0-9]*) ;; *) [ "${#2}" -le 5 ] && return 0 ;; esac ;;
+		night_from|night_to) case "$2" in [0-2][0-9]:[0-5][0-9]) return 0 ;; esac ;;
+		ping_host) case "$2" in ''|*[!A-Za-z0-9._:-]*) ;; *) return 0 ;; esac ;;
+	esac
+	return 1
+}
+# odash led-set key=value ...
+cmd_led_set() {
+	. "$LEDLIB/led-defaults"
+	for a in "$@"; do
+		k="${a%%=*}"; v="${a#*=}"
+		case " $LED_KEYS " in *" $k "*) ;; *) echo "unknown option: $k" >&2; exit 1 ;; esac
+		led_valid "$k" "$v" || { echo "invalid value for $k" >&2; exit 1; }
+	done
+	uci -q get odash.led >/dev/null || uci set odash.led=led
+	for a in "$@"; do uci set "odash.led.${a%%=*}=${a#*=}"; done
+	uci commit odash
+	echo ok
+}
+# odash led-test RRGGBB EFFECT SECONDS | odash led-test off
+cmd_led_test() {
+	mkdir -p "$RUNDIR"
+	if [ "$1" = off ]; then rm -f "$RUNDIR/led.test"; echo ok; return; fi
+	led_valid c_x "$1" && led_valid e_x "${2:-solid}" || { echo "invalid colour or effect" >&2; exit 1; }
+	s="${3:-6}"
+	case "$s" in ''|*[!0-9]*) s=6 ;; esac
+	[ "$s" -le 30 ] || s=30
+	read up _ < /proc/uptime
+	echo "$1 ${2:-solid} $(( ${up%%.*} + s ))" > "$RUNDIR/led.test"
+	echo ok
+}
+
+# ---- fan ----------------------------------------------------------------
+FSYS="${ODASH_SYS:-/sys}"
+fan_dev() {
+	FCD=""
+	for d in "$FSYS"/class/thermal/cooling_device*; do
+		[ "$(cat "$d/type" 2>/dev/null)" = pwm-fan ] && FCD="$d" && break
+	done
+	[ -n "$FCD" ]
+}
+cmd_fan_info() {
+	if ! fan_dev; then printf '{"present":false}\n'; return; fi
+	TZ0="$FSYS/class/thermal/thermal_zone0"
+	t="$(cat "$TZ0/temp" 2>/dev/null)"; t="${t:-0}"
+	cur="$(cat "$FCD/cur_state" 2>/dev/null)"; max="$(cat "$FCD/max_state" 2>/dev/null)"
+	rpm=0
+	for h in "$FSYS"/class/hwmon/hwmon*; do [ -r "$h/fan1_input" ] && { rpm="$(cat "$h/fan1_input")"; break; }; done
+	pol="$(cat "$TZ0/policy" 2>/dev/null)"
+	printf '{"present":true,"temp":%s,"level":%s,"max":%s,"rpm":%s,"policy":"%s","radios":[' "$t" "${cur:-0}" "${max:-3}" "${rpm:-0}" "$(jesc "$pol")"
+	first=1
+	for h in "$FSYS"/class/hwmon/hwmon*; do
+		nm="$(cat "$h/name" 2>/dev/null)"
+		case "$nm" in mt76*|mt79*|mt7915*|ath*|iwlwifi*|phy*)
+			[ -r "$h/temp1_input" ] || continue
+			[ "$first" = 1 ] || printf ','; first=0
+			printf '{"name":"%s","temp":%s}' "$(jesc "$nm")" "$(cat "$h/temp1_input")" ;;
+		esac
+	done
+	printf '],"cfg":{'
+	first=1
+	for k in mode manual_level quiet_on quiet_from quiet_to quiet_override t1 t2 t3 hyst alert_on alert_temp; do
+		case "$k" in mode) d=auto ;; manual_level) d=1 ;; quiet_on|alert_on) d=0 ;; quiet_from) d=23:00 ;; quiet_to) d=07:00 ;; quiet_override) d=75 ;; t1) d=60 ;; t2) d=70 ;; t3) d=80 ;; hyst) d=3 ;; alert_temp) d=80 ;; esac
+		v="$(uci -q get odash.fan.$k)"
+		[ "$first" = 1 ] || printf ','; first=0
+		printf '"%s":"%s"' "$k" "$(jesc "${v:-$d}")"
+	done
+	run=false
+	[ -f "$RUNDIR/fan.pid" ] && kill -0 "$(cat "$RUNDIR/fan.pid")" 2>/dev/null && run=true
+	printf '},"running":%s,"state":' "$run"
+	if [ -r "$RUNDIR/fan.state" ]; then
+		awk -F= 'BEGIN { printf "{" } NF >= 2 { printf "%s\"%s\":\"%s\"", (n++ ? "," : ""), $1, $2 } END { printf "}" }' "$RUNDIR/fan.state"
+	else printf 'null'; fi
+	printf ',"alert":%s,"hist":[' "$([ -f "$RUNDIR/fan.alert" ] && echo true || echo false)"
+	[ -r "$RUNDIR/fan.hist" ] && tail -n 1440 "$RUNDIR/fan.hist" | awk '{ printf "%s[%s,%s,%s]", (n++ ? "," : ""), $1, $2, $3 }'
+	printf '],"maxtemp":'
+	if [ -r "$RUNDIR/fan.hist" ]; then awk 'BEGIN{m=0} $2>m{m=$2} END{print m}' "$RUNDIR/fan.hist"; else echo 0; fi
+	printf '}\n'
+}
+fan_valid() {
+	case "$1" in
+		mode) case "$2" in auto|quiet|performance|manual|custom) return 0 ;; esac ;;
+		manual_level) case "$2" in 0|1|2|3) return 0 ;; esac ;;
+		quiet_on|alert_on) case "$2" in 0|1) return 0 ;; esac ;;
+		quiet_from|quiet_to) case "$2" in [0-2][0-9]:[0-5][0-9]) return 0 ;; esac ;;
+		quiet_override|t1|t2|t3|alert_temp) case "$2" in ''|*[!0-9]*) ;; *) [ "$2" -ge 30 ] && [ "$2" -le 84 ] && return 0 ;; esac ;;
+		hyst) case "$2" in ''|*[!0-9]*) ;; *) [ "$2" -le 15 ] && return 0 ;; esac ;;
+	esac
+	return 1
+}
+cmd_fan_set() {
+	for a in "$@"; do
+		k="${a%%=*}"; v="${a#*=}"
+		fan_valid "$k" "$v" || { echo "invalid value for $k" >&2; exit 1; }
+	done
+	uci -q get odash.fan >/dev/null || uci set odash.fan=fan
+	for a in "$@"; do uci set "odash.fan.${a%%=*}=${a#*=}"; done
+	uci commit odash
+	echo ok
+}
+cmd_fan_test() {
+	mkdir -p "$RUNDIR"
+	if [ "$1" = off ]; then rm -f "$RUNDIR/fan.test"; echo ok; return; fi
+	read up _ < /proc/uptime
+	echo "$(( ${up%%.*} + 10 ))" > "$RUNDIR/fan.test"
+	echo ok
+}
+
+case "$1" in
+	top) shift; cmd_top "$@" ;;
+	json) shift; cmd_json "$@" ;;
+	devices) shift; cmd_devices "$@" ;;
+	known) cmd_known ;;
+	online) cmd_online ;;
+	connections) shift; cmd_connections "$@" ;;
+	live) cmd_live ;;
+	rates) cmd_rates ;;
+	setdev) shift; cmd_setdev "$@" ;;
+	deldev) shift; cmd_deldev "$@" ;;
+	mwan-info) cmd_mwan_info ;;
+	mwan-iface-set) shift; cmd_mwan_iface_set "$@" ;;
+	mwan-setup) shift; cmd_mwan_setup "$@" ;;
+	mwan-service) shift; cmd_mwan_service "$@" ;;
+	mwan-install) shift; cmd_mwan_install "$@" ;;
+	dsched-get) cmd_dsched_get ;;
+	dsched-set) shift; cmd_dsched_set "$@" ;;
+	dsched-run) cmd_dsched_run ;;
+	limit) shift; cmd_limit "$@" ;;
+	limit-sync) shift; cmd_limit_sync "$@" ;;
+	limit-rules) limit_rules ;;
+	block) shift; cmd_block "$@" ;;
+	unblock) shift; cmd_unblock "$@" ;;
+	remove) shift; cmd_remove "$@" ;;
+	status) cmd_status ;;
+	check) cmd_check ;;
+	reset) cmd_reset ;;
+	router-info) cmd_router_info ;;
+	router-tz) shift; cmd_router_tz "$@" ;;
+	router-passwall) shift; cmd_router_passwall "$@" ;;
+	passwall-info) cmd_passwall_info ;;
+	passwall-set) shift; cmd_passwall_set "$@" ;;
+	passwall-node) shift; cmd_passwall_node "$@" ;;
+	router-iface-name) shift; cmd_router_iface_name "$@" ;;
+	router-iface-order) shift; cmd_router_iface_order "$@" ;;
+	router-live) cmd_router_live ;;
+	router-sample) cmd_router_sample ;;
+	router-sysh) shift; cmd_router_sysh "$@" ;;
+	router-ping) shift; cmd_router_ping "$@" ;;
+	router-speed) shift; cmd_router_speed "$@" ;;
+	speed-servers) shift; cmd_speed_servers "$@" ;;
+	router-dnsleak) shift; cmd_router_dnsleak "$@" ;;
+	router-sched-reboot) shift; cmd_router_sched "$@" ;;
+	router-sched-list) cmd_router_sched_list ;;
+	router-sched-save) shift; cmd_router_sched_save "$@" ;;
+	router-sched-del) shift; cmd_router_sched_del "$@" ;;
+	router-sched-run) shift; cmd_router_sched_run "$@" ;;
+	router-wifi-power) shift; cmd_router_wifi_power "$@" ;;
+	router-lan-set) shift; cmd_router_lan "$@" ;;
+	panel-domain-get) cmd_panel_domain_get ;;
+	panel-domain-set) shift; cmd_panel_domain_set "$@" ;;
+	router-dns-set) shift; cmd_router_dns "$@" ;;
+	router-wifi-info) cmd_router_wifi_info ;;
+	router-wifi-scan) cmd_router_wifi_scan ;;
+	router-ap-info) cmd_router_ap_info ;;
+	router-ap-set) shift; cmd_router_ap_set "$@" ;;
+	router-wifi-set) shift; cmd_router_wifi_set "$@" ;;
+	router-reboot) cmd_router_reboot ;;
+	data-export) cmd_data_export ;;
+	data-import-chunk) shift; cmd_data_import_chunk "$@" ;;
+	data-import-apply) cmd_data_import_apply ;;
+	samba-info) cmd_samba_info ;;
+	samba-svc) shift; cmd_samba_svc "$@" ;;
+	samba-global) shift; cmd_samba_global "$@" ;;
+	samba-share-set) shift; cmd_samba_share_set "$@" ;;
+	samba-share-del) shift; cmd_samba_share_del "$@" ;;
+	samba-user-set) shift; cmd_samba_user_set "$@" ;;
+	samba-user-del) shift; cmd_samba_user_del "$@" ;;
+	disk-list) cmd_disk_list ;;
+	samba-traffic) cmd_samba_traffic ;;
+	speed-sched-get) cmd_speed_sched_get ;;
+	speed-sched-set) shift; cmd_speed_sched_set "$@" ;;
+	speed-sched-run) cmd_speed_sched_run ;;
+	backup-get) cmd_backup_get ;;
+	backup-set) shift; cmd_backup_set "$@" ;;
+	backup-run) cmd_backup_run ;;
+	backup-restore) shift; cmd_backup_restore "$@" ;;
+	backup-delete) shift; cmd_backup_delete "$@" ;;
+	pkg-version) cmd_pkg_version ;;
+	pkg-chunk) shift; cmd_pkg_chunk "$@" ;;
+	pkg-apply) cmd_pkg_apply ;;
+	disk-format) shift; cmd_disk_format "$@" ;;
+	disk-mount) shift; cmd_disk_mount "$@" ;;
+	disk-eject) shift; cmd_disk_eject "$@" ;;
+	led-get) cmd_led_get ;;
+	led-set) shift; cmd_led_set "$@" ;;
+	led-test) shift; cmd_led_test "$@" ;;
+	fan-info) cmd_fan_info ;;
+	fan-set) shift; cmd_fan_set "$@" ;;
+	fan-test) shift; cmd_fan_test "$@" ;;
+	*) usage; [ -z "$1" ] || exit 1 ;;
+esac

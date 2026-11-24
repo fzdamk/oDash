@@ -1,0 +1,29 @@
+#!/bin/sh
+# Move an old "site-traffic" install (versions before 0.2.0) over to oDash:
+# keeps the config (device names, blocks, ...) and removes the old files.
+[ -f /etc/config/site-traffic ] || [ -x /etc/init.d/site-traffic ] || exit 0
+
+if [ -x /etc/init.d/site-traffic ]; then
+	/etc/init.d/site-traffic stop >/dev/null 2>&1
+	/etc/init.d/site-traffic disable >/dev/null 2>&1
+fi
+nft delete table inet site_traffic 2>/dev/null
+
+if [ -f /etc/config/site-traffic ]; then
+	if [ ! -s /etc/config/odash ] || ! grep -q "device" /etc/config/odash; then
+		sed 's/site_traffic/odash/g; s/site-traffic/odash/g' /etc/config/site-traffic > /etc/config/odash.new &&
+			mv -f /etc/config/odash.new /etc/config/odash
+	fi
+	rm -f /etc/config/site-traffic
+fi
+[ -f /etc/site-traffic/groups.conf ] && [ ! -f /etc/odash/groups.conf ] && {
+	mkdir -p /etc/odash; cp /etc/site-traffic/groups.conf /etc/odash/groups.conf; }
+
+# keep the collected statistics
+[ -d /tmp/site-traffic ] && [ ! -e /tmp/odash ] && mv /tmp/site-traffic /tmp/odash
+rm -rf /etc/init.d/site-traffic /usr/bin/site-traffic /usr/libexec/site-traffic \
+	/etc/site-traffic /tmp/site-traffic /www/luci-static/resources/view/site-traffic \
+	/usr/share/luci/menu.d/luci-app-site-traffic.json /usr/share/rpcd/acl.d/luci-app-site-traffic.json
+rm -f /tmp/luci-indexcache*
+/etc/init.d/rpcd reload >/dev/null 2>&1
+exit 0

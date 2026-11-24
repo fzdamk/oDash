@@ -1,0 +1,15 @@
+{
+	"admin/status/odash": {
+		"title": "oDash",
+		"order": 0,
+		"action": {
+			"type": "view",
+			"path": "odash/router"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-odash"
+			]
+		}
+	}
+}

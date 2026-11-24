@@ -1,0 +1,27 @@
+#!/bin/sh
+# dns-follow-run: run dns-follow.awk and make sure the "logread -f" / "tcpdump" that awk starts
+# can never outlive it. Without this, every restart of the awk left its logread behind.
+# usage: dns-follow-run <awk arguments...>
+
+# print the pids whose parent is $1
+kids() {
+	for s in /proc/[0-9]*/stat; do
+		read -r l < "$s" 2>/dev/null || continue
+		set -- "$1" ${l##*) }
+		[ "$3" = "$1" ] || continue
+		p="${s#/proc/}"; echo "${p%/stat}"
+	done
+}
+
+killtree() {
+	for k in $(kids "$1"); do killtree "$k"; done
+	kill "$1" 2>/dev/null
+}
+
+/usr/bin/awk "$@" &
+AWK=$!
+trap 'killtree "$AWK"; exit 0' TERM INT HUP
+wait "$AWK"
+rc=$?
+killtree "$AWK"
+exit "$rc"

@@ -1,0 +1,111 @@
+#!/bin/sh
+# oDash fan manager: modes, quiet hours, custom curve, history, hot alert.
+# Hardware trips are never touched; at or above the safe temperature the router's own policy takes over again.
+SYS="${ODASH_SYS:-/sys}"
+RUN="${ODASH_RUN:-/tmp/odash}"
+TZ0="$SYS/class/thermal/thermal_zone0"
+mkdir -p "$RUN"
+echo $$ > "$RUN/fan.pid"
+
+CD=""
+for d in "$SYS"/class/thermal/cooling_device*; do
+	[ "$(cat "$d/type" 2>/dev/null)" = pwm-fan ] && CD="$d" && break
+done
+[ -n "$CD" ] || { echo "no fan" > "$RUN/fan.state"; exit 0; }
+MAXL="$(cat "$CD/max_state" 2>/dev/null)"; MAXL="${MAXL:-3}"
+HW=""
+for h in "$SYS"/class/hwmon/hwmon*; do [ -r "$h/fan1_input" ] && HW="$h" && break; done
+
+dec() { x="$1"; while [ "${x#0}" != "$x" ]; do x="${x#0}"; done; echo "${x:-0}"; }
+num() { case "$1" in ''|*[!0-9]*) echo "$2" ;; *) echo "$1" ;; esac; }
+cfg() { v="$(uci -q get odash.fan.$1)"; echo "${v:-$2}"; }
+fan_load() {
+	MODE="$(cfg mode auto)"; ML="$(num "$(cfg manual_level 1)" 1)"
+	QON="$(cfg quiet_on 0)"; QF="$(cfg quiet_from 23:00)"; QT="$(cfg quiet_to 07:00)"; QO="$(num "$(cfg quiet_override 75)" 75)"
+	T1="$(num "$(cfg t1 60)" 60)"; T2="$(num "$(cfg t2 70)" 70)"; T3="$(num "$(cfg t3 80)" 80)"; HY="$(num "$(cfg hyst 3)" 3)"
+	AON="$(cfg alert_on 0)"; AT="$(num "$(cfg alert_temp 80)" 80)"; SAFE="$(num "$(cfg safe_temp 85)" 85)"
+	QFN="$(echo "$QF" | tr -d :)"; QTN="$(echo "$QT" | tr -d :)"
+	QFN="$(dec "$QFN")"; QTN="$(dec "$QTN")"
+}
+policy() { [ "$(cat "$TZ0/policy" 2>/dev/null)" = "$1" ] || echo "$1" > "$TZ0/policy" 2>/dev/null; }
+setlvl() { [ "$(cat "$CD/cur_state" 2>/dev/null)" = "$1" ] || echo "$1" > "$CD/cur_state" 2>/dev/null; }
+restore() { policy step_wise; CTRL=0; }
+trap 'restore; rm -f "$RUN/fan.pid" "$RUN/fan.alert"; exit 0' INT TERM
+
+# level for a temp with three thresholds and hysteresis against the previous level
+lvl() { # t a b c prev
+	l=0
+	[ "$1" -ge "$2" ] && l=1; [ "$1" -ge "$3" ] && l=2; [ "$1" -ge "$4" ] && l=3
+	if [ "$l" -lt "$5" ]; then
+		h=0
+		[ "$5" -ge 1 ] && [ "$1" -ge $(( $2 - HY )) ] && h=1
+		[ "$5" -ge 2 ] && [ "$1" -ge $(( $3 - HY )) ] && h=2
+		[ "$5" -ge 3 ] && [ "$1" -ge $(( $4 - HY )) ] && h=3
+		[ "$h" -gt "$l" ] && l="$h"
+		[ "$l" -gt "$5" ] && l="$5"
+	fi
+	echo "$l"
+}
+inquiet() {
+	now="$(dec "$(date +%H%M)")"
+	[ "$QON" = 1 ] || return 1
+	if [ "$QFN" -le "$QTN" ]; then [ "$now" -ge "$QFN" ] && [ "$now" -lt "$QTN" ]
+	else [ "$now" -ge "$QFN" ] || [ "$now" -lt "$QTN" ]; fi
+}
+
+CTRL=0; PREV=0; LASTH=0; LASTA=0; SAFEHOLD=0; n=0; LASTL=""
+fan_load
+while :; do
+	n=$((n + 1))
+	read up _ < /proc/uptime; T="${up%%.*}"
+	[ $((n % 3)) -eq 1 ] && fan_load
+	raw="$(cat "$TZ0/temp" 2>/dev/null)"; raw="$(num "$raw" 0)"; TEMP=$((raw / 1000))
+	CUR="$(num "$(cat "$CD/cur_state" 2>/dev/null)" 0)"
+	RPM="$(num "$(cat "$HW/fan1_input" 2>/dev/null)" 0)"
+	why=auto
+
+	# safety: never keep a custom mode when it gets hot
+	if [ "$TEMP" -ge "$SAFE" ]; then SAFEHOLD=1; elif [ "$SAFEHOLD" = 1 ] && [ "$TEMP" -lt $((SAFE - 5)) ]; then SAFEHOLD=0; fi
+
+	want=""; QACT=0
+	if [ -f "$RUN/fan.test" ]; then
+		read tu < "$RUN/fan.test"
+		if [ "$T" -lt "$(num "$tu" 0)" ]; then want="$MAXL"; why=test; else rm -f "$RUN/fan.test"; fi
+	fi
+	if [ "$SAFEHOLD" = 1 ]; then want=""; why=safety
+	elif [ -z "$want" ]; then
+		case "$MODE" in
+			manual) want="$ML"; why=manual ;;
+			quiet) want="$(lvl "$TEMP" 65 75 83 "$PREV")"; why=quiet ;;
+			performance) want="$(lvl "$TEMP" 45 55 65 "$PREV")"; why=performance ;;
+			custom) want="$(lvl "$TEMP" "$T1" "$T2" "$T3" "$PREV")"; why=custom ;;
+			*) want="" ;;
+		esac
+		if [ "$MODE" != manual ] && [ "$MODE" != performance ] && inquiet; then
+			if [ -z "$want" ]; then want="$(lvl "$TEMP" 60 70 80 "$PREV")"; why=quiet-hours; fi
+			if [ "$TEMP" -lt "$QO" ] && [ "$want" -gt 1 ]; then want=1; QACT=1; why=quiet-hours; fi
+		fi
+	fi
+	[ -n "$want" ] && [ "$want" -gt "$MAXL" ] && want="$MAXL"
+
+	if [ -n "$want" ]; then
+		policy user_space; setlvl "$want"; CTRL=1; PREV="$want"
+	elif [ "$CTRL" = 1 ] || [ "$(cat "$TZ0/policy" 2>/dev/null)" = user_space ]; then
+		restore; PREV=0
+	fi
+
+	# alert
+	if [ "$AON" = 1 ] && [ "$TEMP" -ge "$AT" ]; then
+		[ -f "$RUN/fan.alert" ] || echo 1 > "$RUN/fan.alert"
+		if [ $((T - LASTA)) -ge 600 ]; then logger -t odash "High temperature: ${TEMP} C (alert at ${AT} C)"; LASTA=$T; fi
+	elif [ -f "$RUN/fan.alert" ] && [ "$TEMP" -lt $((AT - 3)) ]; then rm -f "$RUN/fan.alert"; fi
+
+	# history: one sample a minute, 24 h
+	if [ $((T - LASTH)) -ge 60 ]; then
+		echo "$(date +%s) $TEMP $CUR" >> "$RUN/fan.hist"; LASTH=$T
+		[ $((n % 30)) -eq 0 ] && [ "$(wc -l < "$RUN/fan.hist")" -gt 1500 ] && tail -n 1440 "$RUN/fan.hist" > "$RUN/fan.hist.t" && mv "$RUN/fan.hist.t" "$RUN/fan.hist"
+	fi
+	printf 'temp=%s\nlevel=%s\nrpm=%s\nwhy=%s\nquiet=%s\nsafe=%s\n' "$TEMP" "$CUR" "$RPM" "$why" "$QACT" "$SAFEHOLD" > "$RUN/fan.state.t" && mv "$RUN/fan.state.t" "$RUN/fan.state"
+	[ -n "$FAN_MAXLOOPS" ] && [ "$n" -ge "$FAN_MAXLOOPS" ] && break
+	sleep "${FAN_TICK:-5}"
+done

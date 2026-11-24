@@ -1,0 +1,14 @@
+{
+	"luci-app-odash": {
+		"description": "Grant access to oDash statistics",
+		"read": {
+			"file": {
+				"/usr/bin/odash": [ "exec" ]
+			},
+			"uci": [ "odash" ]
+		},
+		"write": {
+			"uci": [ "odash" ]
+		}
+	}
+}

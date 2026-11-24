@@ -1,0 +1,33 @@
+# oDash LED: option names and their defaults (sourced by the LED daemon and by "odash")
+LED_KEYS="enabled brightness idle_color night night_from night_to night_level c_offline e_offline c_online e_online c_pass e_pass c_slow e_slow c_cpu e_cpu c_test e_test c_new newdev flicker flicker_kbps ping_host slow_ms cpu_pct"
+d_enabled=0
+d_brightness=100
+d_idle_color=0000ff
+d_night=0
+d_night_from=23:00
+d_night_to=07:00
+d_night_level=0
+d_c_offline=ff0000
+d_e_offline=blink
+d_c_online=ffb000
+d_e_online=solid
+d_c_pass=00ff40
+d_e_pass=solid
+d_c_slow=ff6a00
+d_e_slow=breathe
+d_c_cpu=ff00ff
+d_e_cpu=blink
+d_c_test=00ffff
+d_e_test=breathe
+d_c_new=ffffff
+d_newdev=1
+d_flicker=1
+d_flicker_kbps=200
+d_ping_host=1.1.1.1
+d_slow_ms=250
+d_cpu_pct=90
+
+led_load() {
+	for k in $LED_KEYS; do eval "L_$k=\$d_$k"; done
+	eval "$(uci -q show odash.led 2>/dev/null | sed -n "s/^odash\.led\.\([a-z_0-9]*\)=\(.*\)$/L_\1=\2/p")"
+}

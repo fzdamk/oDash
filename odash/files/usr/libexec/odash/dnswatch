@@ -1,0 +1,34 @@
+#!/bin/sh
+# odash dnswatch: when a proxy (PassWall 2) answers the LAN's DNS with its own
+# dnsmasq, the router's main dnsmasq never sees the clients' queries and the
+# site names cannot be learned. This turns query logging on in those extra
+# dnsmasq processes (and again after the proxy was restarted and rewrote its
+# configuration). Needs no extra package.
+
+INTERVAL="${ST_DNSWATCH_INTERVAL:-20}"
+
+patch_one() {
+	conf="$1"
+	[ -f "$conf" ] || return 0
+	grep -q '^log-queries' "$conf" 2>/dev/null && return 0
+	pid=""
+	for d in /proc/[0-9]*; do
+		c="$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)"
+		case "$c" in */dnsmasq*" -C $conf "*) pid="${d#/proc/}"; args="$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null)"; break ;; esac
+	done
+	[ -n "$pid" ] || return 0
+	echo "log-queries=extra" >> "$conf"
+	bin="$(echo "$args" | sed -n 1p)"
+	set -- $(echo "$args" | sed 1d)
+	logger -t odash "enabling query logging in $(basename "$bin") to learn site names"
+	kill "$pid" 2>/dev/null
+	n=0; while [ -d "/proc/$pid" ] && [ "$n" -lt 20 ]; do sleep 0.2 2>/dev/null || sleep 1; n=$((n + 1)); done
+	"$bin" "$@" >/dev/null 2>&1
+}
+
+while :; do
+	for conf in /tmp/etc/passwall2/acl/*_dnsmasq.conf /tmp/etc/passwall/acl/*_dnsmasq.conf; do
+		[ -f "$conf" ] && patch_one "$conf"
+	done
+	sleep "$INTERVAL"
+done

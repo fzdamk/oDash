@@ -1,0 +1,200 @@
+#!/bin/sh
+# oDash LED daemon: shows the state of the router on its RGB LED.
+# Settings: uci odash.led (see led-defaults). Test hooks: LED_DIR, ODASH_RUN, LED_TICK, LED_MAXTICKS.
+LEDDIR="${LED_DIR:-/sys/class/leds}"
+RUN="${ODASH_RUN:-/tmp/odash}"
+TICK="${LED_TICK:-0.5}"
+MAXTICKS="${LED_MAXTICKS:-0}"
+. "${LED_LIB:-/usr/libexec/odash}/led-defaults"
+mkdir -p "$RUN"
+echo $$ > "$RUN/led.pid"
+
+find_led() { ls "$LEDDIR" 2>/dev/null | grep -i "$1" | head -n 1; }
+R="$(find_led red)"; G="$(find_led green)"; B="$(find_led blue)"
+MONO=0
+if [ -z "$R" ] || [ -z "$G" ] || [ -z "$B" ]; then
+	# no RGB LED: use a plain white and a plain blue LED when the router has them (for example GL.iNet Beryl)
+	WL="$(ls "$LEDDIR" 2>/dev/null | grep -i '^white' | head -n 1)"; BL="$(ls "$LEDDIR" 2>/dev/null | grep -i '^blue' | head -n 1)"
+	if [ -z "$WL" ] && [ -z "$BL" ]; then
+		echo "state=none" > "$RUN/led.state"
+		while :; do sleep 3600; done
+	fi
+	MONO=1
+	for l in "$WL" "$BL"; do [ -n "$l" ] && echo none > "$LEDDIR/$l/trigger" 2>/dev/null; done
+else
+	FR="$LEDDIR/$R/brightness"; FG="$LEDDIR/$G/brightness"; FB="$LEDDIR/$B/brightness"
+	for l in "$R" "$G" "$B"; do echo none > "$LEDDIR/$l/trigger" 2>/dev/null; done
+fi
+
+LAST=""
+put() { # r g b (0-255)
+	[ "$LAST" = "$1 $2 $3" ] && return
+	LAST="$1 $2 $3"
+	echo "$1" > "$FR"; echo "$2" > "$FG"; echo "$3" > "$FB"
+}
+# single-colour LEDs: each one is either on or off
+MLAST=""
+mput() { # white blue (0 or 1)
+	[ "$MLAST" = "$1 $2" ] && return
+	MLAST="$1 $2"
+	[ -n "$WL" ] && echo "$1" > "$LEDDIR/$WL/brightness"
+	[ -n "$BL" ] && echo "$2" > "$LEDDIR/$BL/brightness"
+}
+# state -> effect of the white LED and of the blue LED
+mono_fx() {
+	WE=solid; BE=off
+	case "$STATE" in
+		offline) WE=blink; BE=off ;;
+		slow) WE=slowblink; BE=off ;;
+		cpu) WE=solid; BE=blink ;;
+		passwall) WE=solid; BE=solid ;;
+		test|hot) WE=blink; BE=blink ;;
+		newdevice) WE=solid; BE=blink ;;
+		preview) case "$COL" in 0000ff|0000FF) WE=off; BE="$EFF" ;; *) WE="$EFF"; BE=off ;; esac ;;
+	esac
+	[ "$BUSY" = 1 ] && [ "$STATE" != preview ] && BE=blink
+	[ "$STATE" = preview ] || [ "$NF" -ge 50 ] || { WE=off; BE=off; }
+}
+validhex() { case "$1" in [0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) return 0 ;; esac; return 1; }
+# colour -> three 0-255 values (no subshell)
+split() { # hex -> CR CG CB
+	validhex "$1" || set -- ffffff
+	h="$1"; t="${h#??}"
+	CR=$((0x${h%????})); CG=$((0x${t%??})); CB=$((0x${h#????}))
+}
+level() { # effect tick  -> LV
+	case "$1" in
+		blink) [ $(($2 % 2)) -eq 0 ] && LV=100 || LV=0 ;;
+		slowblink) [ $(($2 % 4)) -lt 2 ] && LV=100 || LV=0 ;;
+		breathe) case $(($2 % 8)) in 0|7) LV=15 ;; 1|6) LV=40 ;; 2|5) LV=70 ;; *) LV=100 ;; esac ;;
+		*) LV=100 ;;
+	esac
+}
+
+dec() { DEC="$1"; while :; do case "$DEC" in 0?*) DEC="${DEC#0}" ;; *) break ;; esac; done; [ -n "$DEC" ] || DEC=0; }
+LL=0; LH=0; LS=0; DT=2; DOREP=0; NF=100; PW=0; DEV=""; NET_MS=""; NET_UP=1; NDOWN=0; NETPID=""; LEASES=""; FLASH=0
+CPU=0; KBPS=0; PT=0; PI=0; PRX=0; BUSY=0; ENAB=""; STATE=none; COL=000000; EFF=solid; WE=solid; BE=off
+led_load
+
+housekeeping() {
+	led_load
+	pgrep -f /tmp/etc/passwall2 >/dev/null 2>&1 && PW=1 || PW=0
+	DEV="$(ip route show default 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n 1)"
+	[ -n "$DEV" ] || NET_UP=0
+	if [ -r "$RUN/led.net" ]; then
+		read nk nms < "$RUN/led.net"
+		if [ "$nk" = ok ]; then NET_UP=1; NET_MS="$nms"; NDOWN=0
+		else NDOWN=$((NDOWN + 1)); NET_MS=""; [ "$NDOWN" -ge 2 ] && NET_UP=0; fi
+		rm -f "$RUN/led.net"
+	fi
+	[ -z "$DEV" ] && NET_UP=0
+	if [ -z "$NETPID" ] || ! kill -0 "$NETPID" 2>/dev/null; then
+		( ms=""
+		  for h in $L_ping_host 1.1.1.1 8.8.8.8; do
+			ms="$(ping -c2 -W3 -q "$h" 2>/dev/null | sed -n 's/.*min\/avg\/max[^=]*= *[0-9.]*\/\([0-9.]*\)\/.*/\1/p')"
+			[ -n "$ms" ] && break
+		  done
+		  if [ -n "$ms" ]; then echo "ok ${ms%.*}"; else echo down; fi > "$RUN/led.net.tmp" && mv "$RUN/led.net.tmp" "$RUN/led.net" ) </dev/null >/dev/null 2>&1 &
+		NETPID=$!
+	fi
+	# a device that was not in the DHCP list before
+	new="$(cut -d' ' -f2 /tmp/dhcp.leases 2>/dev/null | sort | tr '\n' ' ')"
+	if [ -n "$LEASES" ] && [ "$L_newdev" = 1 ]; then
+		for m in $new; do
+			case " $LEASES " in *" $m "*) ;; *) FLASH=$((T + 6)) ;; esac
+		done
+	fi
+	LEASES="$new"
+	# night mode
+	NF=100
+	if [ "$L_night" = 1 ]; then
+		dec "$(date +%H%M)"; hm=$DEC
+		dec "${L_night_from%:*}${L_night_from#*:}"; f=$DEC
+		dec "${L_night_to%:*}${L_night_to#*:}"; t=$DEC
+		if [ "$f" -le "$t" ]; then
+			{ [ "$hm" -ge "$f" ] && [ "$hm" -lt "$t" ]; } && NF="${L_night_level:-0}"
+		else
+			{ [ "$hm" -ge "$f" ] || [ "$hm" -lt "$t" ]; } && NF="${L_night_level:-0}"
+		fi
+	fi
+}
+
+sample() {
+	read _ a b c d e f g h _ < /proc/stat
+	tot=$((a + b + c + d + e + f + g + h)); idl=$((d + e))
+	if [ "$PT" -gt 0 ] && [ "$tot" -gt "$PT" ]; then CPU=$((100 - (idl - PI) * 100 / (tot - PT))); fi
+	PT=$tot; PI=$idl
+	if [ -n "$DEV" ] && [ -r "/sys/class/net/$DEV/statistics/rx_bytes" ]; then
+		read rx < "/sys/class/net/$DEV/statistics/rx_bytes"; read tx < "/sys/class/net/$DEV/statistics/tx_bytes"
+		cur=$((rx + tx))
+		[ "$PRX" -gt 0 ] && [ "$cur" -ge "$PRX" ] && KBPS=$(( (cur - PRX) / (1024 * ${DT:-2}) ))
+		PRX=$cur
+	fi
+	BUSY=0
+	[ "$L_flicker" = 1 ] && [ "$KBPS" -ge "${L_flicker_kbps:-200}" ] && BUSY=1
+}
+
+decide() {
+	STATE=""
+	if [ -f "$RUN/led.test" ]; then
+		read tc te tu < "$RUN/led.test"
+		if [ "$T" -lt "${tu:-0}" ]; then STATE=preview; COL="$tc"; EFF="$te"; else rm -f "$RUN/led.test"; fi
+	fi
+	if [ -z "$STATE" ] && [ "$T" -lt "$FLASH" ]; then STATE=newdevice; COL="$L_c_new"; EFF=blink; fi
+	if [ -z "$STATE" ]; then
+		for j in speed leak; do
+			[ -f "$RUN/$j.pid" ] && kill -0 "$(cat "$RUN/$j.pid")" 2>/dev/null && { STATE=test; COL="$L_c_test"; EFF="$L_e_test"; }
+		done
+	fi
+	if [ -z "$STATE" ] && [ -f "$RUN/fan.alert" ]; then STATE=hot; COL=ff0000; EFF=blink; fi
+	if [ -z "$STATE" ]; then
+		if [ "$NET_UP" != 1 ]; then STATE=offline; COL="$L_c_offline"; EFF="$L_e_offline"
+		elif [ "${L_cpu_pct:-0}" -gt 0 ] && [ "$CPU" -ge "$L_cpu_pct" ]; then STATE=cpu; COL="$L_c_cpu"; EFF="$L_e_cpu"
+		elif [ "${L_slow_ms:-0}" -gt 0 ] && [ -n "$NET_MS" ] && [ "$NET_MS" -ge "$L_slow_ms" ]; then STATE=slow; COL="$L_c_slow"; EFF="$L_e_slow"
+		elif [ "$PW" = 1 ]; then STATE=passwall; COL="$L_c_pass"; EFF="$L_e_pass"
+		else STATE=online; COL="$L_c_online"; EFF="$L_e_online"; fi
+	fi
+}
+
+report() {
+	printf 'state=%s\ncolor=%s\neffect=%s\nms=%s\ncpu=%s\nkbps=%s\npasswall=%s\nnet=%s\ndev=%s\nnight=%s\nmono=%s\nwe=%s\nbe=%s\n' \
+		"$STATE" "$COL" "$EFF" "$NET_MS" "$CPU" "$KBPS" "$PW" "$NET_UP" "$DEV" "$NF" "$MONO" "$WE" "$BE" > "$RUN/led.state.tmp" && mv "$RUN/led.state.tmp" "$RUN/led.state"
+}
+
+n=0
+while :; do
+	n=$((n + 1))
+	read up _ < /proc/uptime; T="${up%%.*}"
+	if [ "$ENAB" != 1 ] || [ $((T - LL)) -ge 5 ]; then led_load; LL=$T; fi
+	if [ "$L_enabled" != 1 ]; then
+		if [ "$ENAB" != 0 ]; then
+			ENAB=0; LAST=""; MLAST=""
+			if [ "$MONO" = 1 ]; then mput 1 0; WE=solid; BE=off; else split "$L_idle_color"; put "$CR" "$CG" "$CB"; fi
+			STATE=disabled; COL="$L_idle_color"; EFF=solid; report
+		fi
+		sleep 2; [ "$MAXTICKS" -gt 0 ] && [ "$n" -ge "$MAXTICKS" ] && break
+		continue
+	fi
+	if [ "$ENAB" != 1 ] || [ $((T - LH)) -ge 5 ]; then housekeeping; LH=$T; fi
+	ENAB=1
+	if [ $((T - LS)) -ge 2 ]; then DT=$((T - LS)); sample; LS=$T; DOREP=1; else DOREP=0; fi
+	decide
+	[ "$DOREP" = 1 ] && report
+	if [ "$MONO" = 1 ]; then
+		mono_fx
+		level "$WE" "$n"; w=$([ "$WE" != off ] && [ "$LV" -ge 50 ] && echo 1 || echo 0)
+		level "$BE" "$n"; b=$([ "$BE" != off ] && [ "$LV" -ge 50 ] && echo 1 || echo 0)
+		mput "$w" "$b"
+		[ "$DOREP" = 1 ] && report
+		case "$WE$BE" in *blink*) sleep "$TICK" ;; *) sleep "${LED_SOLID_TICK:-2}" ;; esac
+		[ "$MAXTICKS" -gt 0 ] && [ "$n" -ge "$MAXTICKS" ] && break
+		continue
+	fi
+	level "$EFF" "$n"
+	[ "$BUSY" = 1 ] && [ $((n % 2)) -eq 1 ] && LV=$((LV * 35 / 100))
+	split "$COL"
+	k=$((LV * ${L_brightness:-100} * NF))
+	put $((CR * k / 1000000)) $((CG * k / 1000000)) $((CB * k / 1000000))
+	case "$EFF" in solid) sleep "${LED_SOLID_TICK:-2}" ;; *) sleep "$TICK" ;; esac
+	[ "$MAXTICKS" -gt 0 ] && [ "$n" -ge "$MAXTICKS" ] && break
+done

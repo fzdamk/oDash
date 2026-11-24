@@ -1,0 +1,91 @@
+#!/bin/sh
+# oDash smbwatch: counts the traffic of Samba (TCP 445 and 139) per client with a
+# small nftables table of its own. This traffic ends on the router itself, so it is not
+# part of the internet usage that oDash shows on the Usage tab, and it is kept apart.
+# Files in $ST_STATE/smb: cur (latest numbers), agg (live history), prev, days.
+# Daily totals are kept in /etc/odash/smb-days.tsv (written every 30 minutes and on stop).
+
+STATE="${ST_STATE:-/tmp/odash}"
+LIBEXEC="${ST_LIBEXEC:-/usr/libexec/odash}"
+W="$STATE/smb"
+DAYS=/etc/odash/smb-days.tsv
+TBL=odash_smb
+
+mkdir -p "$W" /etc/odash
+[ -s "$DAYS" ] && [ ! -s "$W/days" ] && cp "$DAYS" "$W/days"
+touch "$W/agg"
+
+load_table() {
+	nft delete table inet "$TBL" 2>/dev/null
+	nft -f - <<NFT
+table inet $TBL {
+	set rx4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 7d
+		size 1024
+		counter
+	}
+	set rx6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 7d
+		size 1024
+		counter
+	}
+	set tx4 {
+		type ipv4_addr
+		flags dynamic,timeout
+		timeout 7d
+		size 1024
+		counter
+	}
+	set tx6 {
+		type ipv6_addr
+		flags dynamic,timeout
+		timeout 7d
+		size 1024
+		counter
+	}
+	chain rx {
+		type filter hook input priority raw; policy accept;
+		tcp dport { 445, 139 } meta nfproto ipv4 update @rx4 { ip saddr }
+		tcp dport { 445, 139 } meta nfproto ipv6 update @rx6 { ip6 saddr }
+	}
+	chain tx {
+		type filter hook output priority raw; policy accept;
+		tcp sport { 445, 139 } meta nfproto ipv4 update @tx4 { ip daddr }
+		tcp sport { 445, 139 } meta nfproto ipv6 update @tx6 { ip6 daddr }
+	}
+}
+NFT
+}
+
+flush_days() {
+	[ -s "$W/days" ] || return 0
+	cmp -s "$W/days" "$DAYS" 2>/dev/null && return 0
+	cp "$W/days" "$DAYS.tmp" && mv -f "$DAYS.tmp" "$DAYS"
+}
+
+trap 'flush_days; nft delete table inet "$TBL" 2>/dev/null; exit 0' TERM INT
+
+n=0
+while :; do
+	nft list table inet "$TBL" >/dev/null 2>&1 || { load_table || { sleep 30; continue; }; rm -f "$W/prev"; }
+	now="$(date +%s)"
+	cutoff="$(date -d "@$((now - 3024000))" +%Y-%m-%d 2>/dev/null)"
+	{
+		echo "@@ prev"; cat "$W/prev" 2>/dev/null
+		echo "@@ days"; cat "$W/days" 2>/dev/null
+		echo "@@ rx"; nft list set inet "$TBL" rx4 2>/dev/null; nft list set inet "$TBL" rx6 2>/dev/null
+		echo "@@ tx"; nft list set inet "$TBL" tx4 2>/dev/null; nft list set inet "$TBL" tx6 2>/dev/null
+	} | awk -v now="$now" -v today="$(date +%Y-%m-%d)" -v cutoff="$cutoff" -v outcur="$W/cur.new" -v outprev="$W/prev.new" -v outdays="$W/days.new" -v agg="$W/agg" -f "$LIBEXEC/smbwatch.awk" &&
+		{ mv -f "$W/cur.new" "$W/cur"; mv -f "$W/prev.new" "$W/prev"; mv -f "$W/days.new" "$W/days"; }
+	n=$((n + 1))
+	if [ $((n % 100)) -eq 0 ]; then
+		tail -n 200 "$W/agg" > "$W/agg.tmp" && mv -f "$W/agg.tmp" "$W/agg"
+	fi
+	[ $((n % 600)) -eq 0 ] && flush_days
+	sleep 3 &
+	wait $!
+done

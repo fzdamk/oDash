@@ -1,0 +1,21 @@
+config odash 'main'
+	option enabled '1'
+	# Interfaces whose clients are measured (traffic entering/leaving them).
+	list lan_iface 'br-lan'
+	# Seconds between counter reads.
+	option interval '30'
+	# 'registrable' = youtube.com, 'full' = rr1---sn-abc.googlevideo.com
+	option group 'registrable'
+	# Days of history kept in the stats file ("All time" in LuCI).
+	option retention_days '365'
+	# How long an idle IP stays in the kernel set (must exceed 'interval').
+	option idle_timeout '2h'
+	# Working files live in RAM (fast, no flash wear) ...
+	option state_dir '/tmp/odash'
+	# ... and the statistics are copied to flash so they survive a reboot or
+	# power cut. Written at most every save_interval seconds, and only when
+	# something changed. Set persist_file to 'off' to keep nothing.
+	option persist_file '/etc/odash/stats.tsv'
+	option save_interval '300'
+	# Turn on dnsmasq query logging automatically (needed for domain names).
+	option manage_dnsmasq '1'

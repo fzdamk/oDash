@@ -1,0 +1,35 @@
+#!/bin/sh
+# odash rates sampler: every ST_RATE_STEP seconds turn the kernel
+# counters into a throughput sample and keep the last ST_RATE_KEEP samples in
+# $ST_STATE/rates.log, so the LuCI live chart has history when it opens.
+
+STATE="${ST_STATE:-/tmp/odash}"
+TABLE="${ST_TABLE:-odash}"
+STEP="${ST_RATE_STEP:-3}"
+KEEP="${ST_RATE_KEEP:-200}"
+LIBEXEC="${ST_LIBEXEC:-/usr/libexec/odash}"
+
+mkdir -p "$STATE"
+rm -f "$STATE/rates.prev"
+touch "$STATE/rates.log"
+n=0
+
+while :; do
+	if nft list table inet "$TABLE" >/dev/null 2>&1; then
+		{
+			echo "@@ mac";  cat "$STATE/macmap" 2>/dev/null
+			echo "@@ map";  cat "$STATE/ipmap" 2>/dev/null
+			echo "@@ prev"; cat "$STATE/rates.prev" 2>/dev/null
+			echo "@@ up";   nft list set inet "$TABLE" up4 2>/dev/null; nft list set inet "$TABLE" up6 2>/dev/null
+			echo "@@ down"; nft list set inet "$TABLE" dn4 2>/dev/null; nft list set inet "$TABLE" dn6 2>/dev/null
+		} | awk -v now="$(date +%s)" -v outprev="$STATE/rates.prev.new" -f "$LIBEXEC/rates.awk" >> "$STATE/rates.log" &&
+			mv -f "$STATE/rates.prev.new" "$STATE/rates.prev"
+		n=$((n + 1))
+		if [ "$n" -ge 20 ]; then
+			tail -n "$KEEP" "$STATE/rates.log" > "$STATE/rates.tmp" && mv -f "$STATE/rates.tmp" "$STATE/rates.log"
+			n=0
+		fi
+	fi
+	sleep "$STEP" &
+	wait $!
+done
