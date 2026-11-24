@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>oDash: OpenWrt LuCI dashboard for bandwidth per device and per site</title>
+<meta name="description" content="oDash is a free, open-source LuCI dashboard for OpenWrt routers. See bandwidth per device and per website, set speed limits, block devices, manage Wi-Fi, Samba and USB disks. One-command install on any architecture.">
+<meta name="keywords" content="OpenWrt, LuCI, bandwidth monitor, traffic monitor, per device bandwidth, per site traffic, parental control, speed limit, nlbwmon alternative, wrtbwmon alternative, GL.iNet, router dashboard">
+<link rel="canonical" href="https://fzdamk.github.io/oDash/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="oDash: your OpenWrt router, finally readable">
+<meta property="og:description" content="Bandwidth per device and per site, device control and router tools for OpenWrt, inside LuCI.">
+<meta property="og:url" content="https://fzdamk.github.io/oDash/">
+<meta property="og:image" content="https://fzdamk.github.io/oDash/img/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://fzdamk.github.io/oDash/img/og.png">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%232563eb'/%3E%3Cpath d='M5 16l4-5 3 3 6-7' fill='none' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<script type="application/ld+json">
+{"@context":"https://schema.org","@type":"SoftwareApplication","name":"oDash","applicationCategory":"NetworkingApplication","operatingSystem":"OpenWrt","softwareVersion":"1.0.0","license":"https://opensource.org/licenses/MIT","offers":{"@type":"Offer","price":"0","priceCurrency":"USD"},"url":"https://fzdamk.github.io/oDash/","downloadUrl":"https://github.com/fzdamk/oDash/releases/latest","codeRepository":"https://github.com/fzdamk/oDash","description":"LuCI dashboard for OpenWrt: bandwidth per device and per site, speed limits, device blocking, Wi-Fi, Samba and router tools."}
+</script>
+<style>
+:root{--ink:#0f172a;--mut:#475569;--line:#e2e8f0;--blue:#2563eb;--cyan:#06b6d4}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:var(--ink);background:#fff;line-height:1.6;-webkit-font-smoothing:antialiased}
+a{color:var(--blue);text-decoration:none}a:hover{text-decoration:underline}
+.w{max-width:1120px;margin:0 auto;padding:0 24px}
+code,.mono{font-family:ui-monospace,"SFMono-Regular",Consolas,"DejaVu Sans Mono",monospace}
+nav{position:sticky;top:0;z-index:5;background:rgba(6,10,24,.82);backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,.08)}
+nav .w{display:flex;align-items:center;gap:22px;height:60px}
+.brand{display:flex;align-items:center;gap:10px;color:#fff;font-weight:800;font-size:19px}
+.mk{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#3b82f6,#06b6d4);display:flex;align-items:center;justify-content:center}
+nav .sp{flex:1}nav a.l{color:#cbd5e1;font-size:14px;font-weight:500}nav a.l:hover{color:#fff;text-decoration:none}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:11px 18px;border-radius:10px;font-weight:600;font-size:15px}
+.btn.p{background:linear-gradient(135deg,#3b82f6,#0891b2);color:#fff;box-shadow:0 8px 24px -8px rgba(37,99,235,.7)}
+.btn.g{background:rgba(255,255,255,.08);color:#e2e8f0;border:1px solid rgba(255,255,255,.16)}
+.btn:hover{text-decoration:none;filter:brightness(1.08)}
+header{background:#060a18;color:#fff;position:relative;overflow:hidden;padding:80px 0 0}
+header:before{content:"";position:absolute;width:640px;height:640px;left:-200px;top:-260px;background:#1d4ed8;filter:blur(110px);opacity:.5;border-radius:50%}
+header:after{content:"";position:absolute;width:520px;height:520px;right:-140px;top:120px;background:#06b6d4;filter:blur(110px);opacity:.3;border-radius:50%}
+header .w{position:relative;z-index:1;text-align:center}
+.eyebrow{display:inline-block;font-size:13px;font-weight:600;letter-spacing:.04em;color:#93c5fd;background:rgba(59,130,246,.14);border:1px solid rgba(96,165,250,.3);padding:5px 12px;border-radius:999px}
+h1{font-size:clamp(38px,6vw,66px);line-height:1.04;letter-spacing:-.03em;font-weight:800;margin:22px auto 0;max-width:860px}
+h1 span{background:linear-gradient(90deg,#60a5fa,#22d3ee);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{font-size:19px;color:#b6c2dc;max-width:680px;margin:20px auto 0}
+.cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:30px}
+.cmd{display:flex;align-items:center;gap:12px;max-width:760px;margin:26px auto 0;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:12px 12px 12px 18px;text-align:left}
+.cmd code{flex:1;font-size:14px;color:#dbeafe;overflow-x:auto;white-space:nowrap}
+.cmd code b{color:#22d3ee;font-weight:400}
+.cp{border:0;cursor:pointer;background:#fff;color:#0f172a;font:600 13px Inter,system-ui,sans-serif;padding:8px 12px;border-radius:8px}
+.hero-img{margin:54px auto 0;max-width:1060px}
+.frame{border-radius:14px 14px 0 0;overflow:hidden;background:#fff;box-shadow:0 -10px 70px rgba(56,189,248,.3);max-height:520px}.frame img{display:block;width:100%}.fb{height:34px;background:#eef1f6;display:flex;align-items:center;gap:7px;padding:0 14px;border-bottom:1px solid #e2e6ee}.fb i{width:11px;height:11px;border-radius:50%;background:#ff5f57}.fb i+i{background:#febc2e}.fb i+i+i{background:#28c840}.fb b{margin-left:14px;font:500 12px Inter,system-ui,sans-serif;color:#7a8499;background:#fff;border-radius:9px;padding:2px 12px}
+section{padding:86px 0}
+h2{font-size:clamp(28px,3.6vw,40px);letter-spacing:-.02em;line-height:1.1;font-weight:800}
+.sub{color:var(--mut);font-size:18px;margin-top:12px;max-width:680px}
+.c{text-align:center}.c .sub{margin-left:auto;margin-right:auto}
+.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px;margin-top:44px}
+.f{border:1px solid var(--line);border-radius:16px;padding:22px;background:#fff;transition:.2s}
+.f:hover{transform:translateY(-3px);box-shadow:0 16px 36px -18px rgba(15,23,42,.3)}
+.f i{display:flex;width:42px;height:42px;border-radius:12px;align-items:center;justify-content:center;margin-bottom:14px}
+.f h3{font-size:17px;font-weight:700}.f p{font-size:14.5px;color:var(--mut);margin-top:6px;line-height:1.5}
+.show{display:grid;gap:30px;margin-top:46px}
+.show img{width:100%;display:block;border-radius:18px;box-shadow:0 30px 60px -30px rgba(15,23,42,.45)}
+.alt{background:#f6f8fb}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:40px;align-items:start;margin-top:40px}
+table{width:100%;border-collapse:collapse;font-size:15px}td{padding:12px 10px;border-bottom:1px solid var(--line);vertical-align:top}td:first-child{font-weight:600;white-space:nowrap;color:var(--ink);width:38%}
+td code{font-size:13px;background:#eef2f7;padding:2px 6px;border-radius:6px}
+.term{background:#0b1020;color:#cbd5e1;border-radius:14px;padding:20px 22px;font-size:13.5px;line-height:1.85;box-shadow:0 30px 60px -30px rgba(2,8,23,.6)}
+.term .g{color:#4ade80}.term .b{color:#60a5fa}.term .d{color:#64748b}
+ul.chk{list-style:none;display:grid;gap:12px;margin-top:22px}
+ul.chk li{display:flex;gap:12px;font-size:16px;color:#334155}
+ul.chk li:before{content:"";flex:none;width:22px;height:22px;border-radius:50%;background:#dcfce7 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='M6 12l4 4 8-9' fill='none' stroke='%2316a34a' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E") center/14px no-repeat;margin-top:2px}
+.faq details{border-bottom:1px solid var(--line);padding:18px 0}
+.faq summary{font-weight:700;font-size:17px;cursor:pointer;list-style:none}.faq summary::-webkit-details-marker{display:none}
+.faq summary:after{content:"+";float:right;color:var(--mut);font-weight:400}.faq details[open] summary:after{content:"−"}
+.faq p{color:var(--mut);margin-top:10px}
+.end{background:#060a18;color:#fff;text-align:center}
+.end .sub{color:#94a3b8}
+footer{background:#060a18;color:#64748b;font-size:14px;border-top:1px solid rgba(255,255,255,.08);padding:26px 0}
+footer .w{display:flex;gap:18px;flex-wrap:wrap;justify-content:space-between}
+footer a{color:#94a3b8}
+@media(max-width:900px){.grid{grid-template-columns:1fr 1fr}.cols{grid-template-columns:1fr}nav a.l{display:none}}
+@media(max-width:560px){.grid{grid-template-columns:1fr}header{padding-top:56px}section{padding:64px 0}}
+</style>
+</head>
+<body>
+<nav><div class="w">
+<a class="brand" href="#"><span class="mk"><svg width="18" height="18" viewBox="0 0 24 24"><path d="M4 16l4.5-5 3.5 3 6-7.5" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>oDash</a>
+<span class="sp"></span>
+<a class="l" href="#features">Features</a><a class="l" href="#install">Install</a><a class="l" href="#privacy">Privacy</a><a class="l" href="#faq">FAQ</a>
+<a class="btn g" style="padding:7px 14px;font-size:14px" href="https://github.com/fzdamk/oDash">GitHub</a>
+</div></nav>
+
+<header><div class="w">
+<span class="eyebrow">Free and open source · OpenWrt · LuCI</span>
+<h1>Your OpenWrt router, <span>finally readable.</span></h1>
+<p class="lead">oDash shows bandwidth per device and per website, lets you limit and block devices, and puts Wi-Fi, network, Samba and router tools on one LuCI page.</p>
+<div class="cmd"><code id="c1"><b>$</b> wget -qO- https://raw.githubusercontent.com/fzdamk/oDash/main/install.sh | sh</code><button class="cp" data-c="c1">Copy</button></div>
+<div class="cta"><a class="btn p" href="#install">Install guide</a><a class="btn g" href="https://github.com/fzdamk/oDash/releases/latest">Download v1.0.0</a></div>
+<div class="hero-img"><div class="frame"><div class="fb"><i></i><i></i><i></i><b>192.168.1.1/cgi-bin/luci/admin/status/odash</b></div><img src="img/devices-screen.png" alt="oDash device list in OpenWrt LuCI" width="1250" height="900"></div></div>
+</div></header>
+
+<section id="features"><div class="w c">
+<h2>Everything your router knows, on one page</h2>
+<p class="sub">Built from your router's own firewall counters and DNS log. Nothing to install on your phones or PCs.</p>
+<div class="grid" style="text-align:left">
+<div class="f"><i style="background:#dbeafe"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round"><path d="M4 19V5M4 19h16M8 15l3-4 3 2 4-6"/></svg></i><h3>Bandwidth per device</h3><p>Live throughput and usage history for every phone, PC, TV and camera.</p></div>
+<div class="f"><i style="background:#ffedd5"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#ea580c" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></i><h3>Traffic per website</h3><p>See which sites and services use your bandwidth, by day, hour or all time.</p></div>
+<div class="f"><i style="background:#cffafe"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#0891b2" stroke-width="2" stroke-linecap="round"><path d="M12 4v16M6 10l6-6 6 6M5 20h14"/></svg></i><h3>Speed limits</h3><p>Cap download and upload speed for any single device.</p></div>
+<div class="f"><i style="background:#fee2e2"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#dc2626" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M6 6l12 12"/></svg></i><h3>Block and schedule</h3><p>Block a device or a site now, or allow it only at set times.</p></div>
+<div class="f"><i style="background:#ede9fe"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></i><h3>Connection timeline</h3><p>Who was online and for how long, for up to 7 days, kept across reboots.</p></div>
+<div class="f"><i style="background:#e0e7ff"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#4f46e5" stroke-width="2" stroke-linecap="round"><path d="M2 9a15 15 0 0 1 20 0M5 13a10 10 0 0 1 14 0M8.5 16.5a5 5 0 0 1 7 0"/></svg></i><h3>Wi-Fi and WAN</h3><p>Wi-Fi radios, Wi-Fi uplink, multi-WAN failover and load balancing.</p></div>
+<div class="f"><i style="background:#fae8ff"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c026d3" stroke-width="2" stroke-linecap="round"><path d="M4 17a8 8 0 1 1 16 0M12 17l4-5"/></svg></i><h3>Speed and leak tests</h3><p>Speed tests, ping checks and DNS / IP leak tests from the router itself.</p></div>
+<div class="f"><i style="background:#dcfce7"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#16a34a" stroke-width="2" stroke-linecap="round"><rect x="3" y="6" width="18" height="12" rx="2"/><path d="M6 12h6"/><circle cx="17" cy="12" r="1.5"/></svg></i><h3>Samba and USB disks</h3><p>Shares, users, formatting, mounting and safe removal.</p></div>
+</div>
+<div class="show">
+<img src="img/banner-devices.png" alt="oDash devices page: names, fixed IPs, speed limits and blocking" loading="lazy" width="1280" height="640">
+<img src="img/banner-traffic.png" alt="oDash traffic per site, per device and per day" loading="lazy" width="1280" height="640">
+<img src="img/banner-timeline.png" alt="oDash connection timeline showing how long each device was online" loading="lazy" width="1280" height="640">
+<img src="img/banner-themes.png" alt="oDash themes: Default, Sidebar, Neon console, Bento and Soft" loading="lazy" width="1280" height="640">
+</div>
+</div></section>
+
+<section id="install" class="alt"><div class="w">
+<h2>Install in one command</h2>
+<p class="sub">oDash is shell, awk and JavaScript only, so the same package runs on every OpenWrt architecture. Run this on the router over SSH:</p>
+<div class="cols">
+<div class="term mono"><div><span class="g">root@OpenWrt</span>:<span class="b">~</span># wget -qO- https://raw.githubusercontent.com/\</div><div>&nbsp;&nbsp;fzdamk/oDash/main/install.sh | sh</div><div class="d">Downloading oDash (latest) from github.com/fzdamk/oDash ...</div><div><span class="g">✓</span> Checksum OK.</div><div><span class="g">✓</span> oDash installed.</div><div>Done. Open LuCI, then Status &gt; oDash.</div></div>
+<table>
+<tr><td>Router with curl</td><td><code>curl -fsSL …/install.sh | sh</code></td></tr>
+<tr><td>A specific version</td><td><code>ODASH_VERSION=1.0.0 sh install.sh</code></td></tr>
+<tr><td>Update</td><td>Run the install command again, or use System &gt; Update oDash in the panel.</td></tr>
+<tr><td>Remove, keep data</td><td><code>sh install.sh uninstall</code></td></tr>
+<tr><td>Remove everything</td><td><code>sh install.sh uninstall --purge</code></td></tr>
+<tr><td>Package files</td><td><a href="https://github.com/fzdamk/oDash/releases/latest">.ipk and .tar.gz on Releases</a></td></tr>
+</table>
+</div>
+<p class="sub" style="font-size:15px;margin-top:26px">Needs OpenWrt with LuCI. Developed on OpenWrt 25.12 (apk); the installer also supports opkg. About 1.5 MB of flash. Missing requirements (nftables, luci-base, logd, jsonfilter) are installed for you.</p>
+</div></section>
+
+<section id="privacy"><div class="w cols" style="margin-top:0;align-items:center">
+<div><h2>Your data stays on your router</h2><p class="sub">oDash is a local tool. It does not phone home.</p>
+<ul class="chk"><li>No account and no sign-up</li><li>No telemetry and no cloud service</li><li>History is stored on the router, in RAM and in /etc/odash</li><li>Internet is used only for the tests you run, and for site icons, flags and theme fonts that your browser loads</li></ul></div>
+<img src="img/privacy-art.png" alt="oDash keeps all data on the router" style="width:100%;max-width:480px;display:block;margin:0 auto;border-radius:24px" loading="lazy">
+</div></section>
+
+<section id="faq" class="alt"><div class="w faq" style="max-width:820px">
+<h2 class="c" style="margin-bottom:24px">Questions</h2>
+<details><summary>How do I see bandwidth per device on OpenWrt?</summary><p>Install oDash and open Status &gt; oDash &gt; Devices or Traffic. It counts traffic per device with nftables and shows live rates and history.</p></details>
+<details><summary>Can it show which websites use my bandwidth?</summary><p>Yes. oDash reads the router's dnsmasq query log and groups traffic by site and service, per device and per day.</p></details>
+<details><summary>Is it an alternative to nlbwmon or wrtbwmon?</summary><p>It covers the same need, bandwidth per device, and adds per-site statistics, speed limits, blocking, schedules, a connection timeline and router tools in one LuCI page.</p></details>
+<details><summary>Which routers does it work on?</summary><p>Any router running OpenWrt with LuCI, on any CPU architecture, because the package contains no compiled code. It is developed on a GL.iNet router with OpenWrt 25.12.</p></details>
+<details><summary>Does it slow down the router?</summary><p>Counting is done by the kernel firewall. oDash reads counters every 30 seconds by default and saves statistics to flash every 5 minutes, only when something changed.</p></details>
+<details><summary>Is it free?</summary><p>Yes, MIT licensed. The source is on GitHub.</p></details>
+</div></section>
+
+<section class="end"><div class="w">
+<h2>Give your router a dashboard</h2>
+<p class="sub" style="margin:12px auto 0">One command on the router, then open Status &gt; oDash.</p>
+<div class="cmd"><code id="c2"><b>$</b> wget -qO- https://raw.githubusercontent.com/fzdamk/oDash/main/install.sh | sh</code><button class="cp" data-c="c2">Copy</button></div>
+<div class="cta"><a class="btn p" href="https://github.com/fzdamk/oDash">Star on GitHub</a><a class="btn g" href="https://github.com/fzdamk/oDash/issues">Report an issue</a></div>
+</div></section>
+
+<footer><div class="w"><span>oDash · MIT license</span><span><a href="https://github.com/fzdamk/oDash">GitHub</a> · <a href="https://github.com/fzdamk/oDash/releases">Releases</a> · <a href="https://openwrt.org">OpenWrt</a></span></div></footer>
+<script>
+document.querySelectorAll('.cp').forEach(function(b){b.addEventListener('click',function(){var t=document.getElementById(b.dataset.c).textContent.replace(/^\$\s*/,'');(navigator.clipboard?navigator.clipboard.writeText(t):Promise.reject()).then(function(){b.textContent='Copied';setTimeout(function(){b.textContent='Copy'},1500)}).catch(function(){})})});
+</script>
+</body></html>
